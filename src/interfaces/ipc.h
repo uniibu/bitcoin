@@ -1,13 +1,18 @@
-// Copyright (c) 2021 The Bitcoin Core developers
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_INTERFACES_IPC_H
 #define BITCOIN_INTERFACES_IPC_H
 
+#include <ipc/types.h>
+#include <util/result.h>
+
 #include <functional>
 #include <memory>
+#include <string>
 #include <typeindex>
+#include <utility>
 
 namespace ipc {
 struct Context;
@@ -41,6 +46,11 @@ class Init;
 //!    to make other proxy objects calling other remote interfaces. It can also
 //!    destroy the initial interfaces::Init object to close the connection and
 //!    shut down the spawned process.
+//!
+//! When connecting to an existing process, the steps are similar to spawning a
+//! new process, except a socket is created instead of a socketpair, and
+//! destroying an Init interface doesn't end the process, since there can be
+//! multiple connections.
 class Ipc
 {
 public:
@@ -53,6 +63,25 @@ public:
     //! process by forwarding them to this process's Init interface, then return
     //! true. If this is not a spawned child process, return false.
     virtual bool startSpawnedProcess(int argc, char* argv[], int& exit_status) = 0;
+
+    //! Connect to a socket address and return a pointer to its Init interface.
+    //! Returns a non-null pointer if the connection was established, returns
+    //! null if address is empty ("") or disabled ("0") or if a connection was
+    //! refused but not required ("auto"), and throws an exception if there was
+    //! an unexpected error.
+    virtual std::unique_ptr<Init> connectAddress(std::string& address) = 0;
+
+    //! Parse an IPC listening address and its per-listener options.
+    static util::Result<ipc::ListenAddress> parseListenAddress(std::string address);
+
+    //! Listen on a configured socket address exposing this process's init
+    //! interface and accepting at most listen_address.max_connections simultaneous
+    //! client connections. Updates listen_address.address with the resolved socket
+    //! address. Throws an exception if there was an error.
+    virtual void listenAddress(ipc::ListenAddress& listen_address) = 0;
+
+    //! Disconnect any incoming connections that are still connected.
+    virtual void disconnectIncoming() = 0;
 
     //! Add cleanup callback to remote interface that will run when the
     //! interface is deleted.

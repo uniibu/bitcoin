@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 The Bitcoin Core developers
+// Copyright (c) 2015-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,6 +6,7 @@
 #include <chainparams.h>
 #include <pow.h>
 #include <test/util/random.h>
+#include <test/util/common.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 
@@ -63,6 +64,36 @@ BOOST_AUTO_TEST_CASE(get_next_work_lower_limit_actual)
     BOOST_CHECK(!PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
 }
 
+/* Test that the largest permitted difficulty increase is not itself rejected
+ * when the new target is not exactly representable in compact form. */
+BOOST_AUTO_TEST_CASE(get_next_work_lower_limit_rounding)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    CBlockIndex pindexLast;
+    pindexLast.nHeight = 68543;
+    pindexLast.nTime = 1279297671;
+    pindexLast.nBits = 0x1c05a3f5; // Mantissa is not a multiple of four
+    int64_t nLastRetargetTime = pindexLast.nTime - consensus.nPowTargetTimespan/4;
+    unsigned int expected_nbits = 0x1c0168fdU;
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+}
+
+/* Test the lower bound for a negative actual time taken, which is possible
+ * because timestamps only have to exceed the median of the previous eleven. */
+BOOST_AUTO_TEST_CASE(get_next_work_negative_actual)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    int64_t nLastRetargetTime = 1279297671; // Later than pindexLast.nTime
+    CBlockIndex pindexLast;
+    pindexLast.nHeight = 68543;
+    pindexLast.nTime = 1279008237;
+    pindexLast.nBits = 0x1c05a3f4;
+    unsigned int expected_nbits = 0x1c0168fdU;
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+}
+
 /* Test the constraint on the upper bound for actual time taken */
 BOOST_AUTO_TEST_CASE(get_next_work_upper_limit_actual)
 {
@@ -80,13 +111,50 @@ BOOST_AUTO_TEST_CASE(get_next_work_upper_limit_actual)
     BOOST_CHECK(!PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
 }
 
+/* Test that the retarget window starts at the timestamp of the first block
+ * of the window, not its median time past. */
+BOOST_AUTO_TEST_CASE(get_next_work_first_block_time)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const int64_t interval{consensus.DifficultyAdjustmentInterval()};
+
+    // Two retarget windows, so that the first block of the second one has
+    // ancestors and hence a median time past earlier than its own time.
+    std::vector<CBlockIndex> blocks(2 * interval);
+    for (int64_t i = 0; i < 2 * interval; i++) {
+        blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
+        blocks[i].nHeight = i;
+        blocks[i].nTime = 1269211443 + i * consensus.nPowTargetSpacing;
+        blocks[i].nBits = 0x1c05a3f4;
+    }
+
+    const CBlockIndex& first{blocks[interval]};
+    const CBlockIndex& last{blocks[2 * interval - 1]};
+    BOOST_CHECK_NE(first.GetBlockTime(), first.GetMedianTimePast());
+    unsigned int expected_nbits = 0x1c05a33c;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&last, nullptr, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, last.nHeight+1, last.nBits, expected_nbits));
+}
+
+/* Test that nbits is only permitted to change at a difficulty adjustment. */
+BOOST_AUTO_TEST_CASE(permitted_difficulty_transition_no_retarget)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const int64_t height{consensus.DifficultyAdjustmentInterval() + 1}; // Not a retarget height
+
+    const unsigned int nbits{0x1c05a3f4};
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, height, nbits, nbits));
+    BOOST_CHECK(!PermittedDifficultyTransition(consensus, height, nbits, nbits - 1));
+    BOOST_CHECK(!PermittedDifficultyTransition(consensus, height, nbits, nbits + 1));
+}
+
 BOOST_AUTO_TEST_CASE(CheckProofOfWork_test_negative_target)
 {
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     uint256 hash;
     unsigned int nBits;
     nBits = UintToArith256(consensus.powLimit).GetCompact(true);
-    hash.SetHex("0x1");
+    hash = uint256{1};
     BOOST_CHECK(!CheckProofOfWork(hash, nBits, consensus));
 }
 
@@ -95,7 +163,7 @@ BOOST_AUTO_TEST_CASE(CheckProofOfWork_test_overflow_target)
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     uint256 hash;
     unsigned int nBits{~0x00800000U};
-    hash.SetHex("0x1");
+    hash = uint256{1};
     BOOST_CHECK(!CheckProofOfWork(hash, nBits, consensus));
 }
 
@@ -107,7 +175,7 @@ BOOST_AUTO_TEST_CASE(CheckProofOfWork_test_too_easy_target)
     arith_uint256 nBits_arith = UintToArith256(consensus.powLimit);
     nBits_arith *= 2;
     nBits = nBits_arith.GetCompact();
-    hash.SetHex("0x1");
+    hash = uint256{1};
     BOOST_CHECK(!CheckProofOfWork(hash, nBits, consensus));
 }
 
@@ -134,6 +202,23 @@ BOOST_AUTO_TEST_CASE(CheckProofOfWork_test_zero_target)
     BOOST_CHECK(!CheckProofOfWork(hash, nBits, consensus));
 }
 
+BOOST_AUTO_TEST_CASE(GetBitsProof_test)
+{
+    // Targets that are zero, negative or overflow encode no work.
+    BOOST_CHECK_EQUAL(GetBitsProof(0x00000000), arith_uint256{0});
+    BOOST_CHECK_EQUAL(GetBitsProof(0x01003456), arith_uint256{0});
+    BOOST_CHECK_EQUAL(GetBitsProof(0x04923456), arith_uint256{0});
+    BOOST_CHECK_EQUAL(GetBitsProof(0xff123456), arith_uint256{0});
+    // The exponent byte is unsigned, so this is a large exponent that overflows.
+    BOOST_CHECK_EQUAL(GetBitsProof(0x80010203), arith_uint256{0});
+    // The two overflows above shift every mantissa bit out of 256 bits, so they would
+    // also give zero work without the overflow check. This one keeps the low bits of
+    // its mantissa when truncated.
+    BOOST_CHECK_EQUAL(GetBitsProof(0x21012345), arith_uint256{0});
+    // The genesis block target.
+    BOOST_CHECK_EQUAL(GetBitsProof(0x1d00ffff), arith_uint256{0x100010001});
+}
+
 BOOST_AUTO_TEST_CASE(GetBlockProofEquivalentTime_test)
 {
     const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
@@ -147,9 +232,9 @@ BOOST_AUTO_TEST_CASE(GetBlockProofEquivalentTime_test)
     }
 
     for (int j = 0; j < 1000; j++) {
-        CBlockIndex *p1 = &blocks[InsecureRandRange(10000)];
-        CBlockIndex *p2 = &blocks[InsecureRandRange(10000)];
-        CBlockIndex *p3 = &blocks[InsecureRandRange(10000)];
+        CBlockIndex *p1 = &blocks[m_rng.randrange(10000)];
+        CBlockIndex *p2 = &blocks[m_rng.randrange(10000)];
+        CBlockIndex *p3 = &blocks[m_rng.randrange(10000)];
 
         int64_t tdiff = GetBlockProofEquivalentTime(*p1, *p2, *p3, chainParams->GetConsensus());
         BOOST_CHECK_EQUAL(tdiff, p1->GetBlockTime() - p2->GetBlockTime());
@@ -171,13 +256,14 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
     arith_uint256 pow_compact;
     bool neg, over;
     pow_compact.SetCompact(chainParams->GenesisBlock().nBits, &neg, &over);
-    BOOST_CHECK(!neg && pow_compact != 0);
+    BOOST_CHECK(!neg);
+    BOOST_CHECK(pow_compact != 0);
     BOOST_CHECK(!over);
     BOOST_CHECK(UintToArith256(consensus.powLimit) >= pow_compact);
 
     // check max target * 4*nPowTargetTimespan doesn't overflow -- see pow.cpp:CalculateNextWorkRequired()
     if (!consensus.fPowNoRetargeting) {
-        arith_uint256 targ_max("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        arith_uint256 targ_max{UintToArith256(uint256{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"})};
         targ_max /= consensus.nPowTargetTimespan*4;
         BOOST_CHECK(UintToArith256(consensus.powLimit) < targ_max);
     }
@@ -196,6 +282,11 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::TESTNET);
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_sanity)
+{
+    sanity_check_chainparams(*m_node.args, ChainType::TESTNET4);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)

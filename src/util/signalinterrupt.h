@@ -1,4 +1,4 @@
-// Copyright (c) 2023 The Bitcoin Core developers
+// Copyright (c) 2023-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -13,7 +13,6 @@
 #endif
 
 #include <atomic>
-#include <cstdlib>
 
 namespace util {
 /**
@@ -30,9 +29,9 @@ class SignalInterrupt
 public:
     SignalInterrupt();
     explicit operator bool() const;
-    void operator()();
-    void reset();
-    void wait();
+    [[nodiscard]] bool operator()();
+    [[nodiscard]] bool reset();
+    [[nodiscard]] bool wait();
 
 private:
     std::atomic<bool> m_flag;

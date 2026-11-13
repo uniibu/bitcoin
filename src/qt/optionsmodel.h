@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2022 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,10 +8,13 @@
 #include <cstdint>
 #include <qt/bitcoinunits.h>
 #include <qt/guiconstants.h>
+#include <util/byte_units.h>
 
 #include <QAbstractListModel>
+#include <QFont>
 
-#include <assert.h>
+#include <cassert>
+#include <variant>
 
 struct bilingual_str;
 namespace interfaces {
@@ -19,17 +22,17 @@ class Node;
 }
 
 extern const char *DEFAULT_GUI_PROXY_HOST;
-static constexpr uint16_t DEFAULT_GUI_PROXY_PORT = 9050;
+inline constexpr uint16_t DEFAULT_GUI_PROXY_PORT = 9050;
 
 /**
  * Convert configured prune target MiB to displayed GB. Round up to avoid underestimating max disk usage.
  */
-static inline int PruneMiBtoGB(int64_t mib) { return (mib * 1024 * 1024 + GB_BYTES - 1) / GB_BYTES; }
+static inline int PruneMiBtoGB(int64_t mib) { return (mib * 1_MiB + GB_BYTES - 1) / GB_BYTES; }
 
 /**
  * Convert displayed prune target GB to configured MiB. Round down so roundtrip GB -> MiB -> GB conversion is stable.
  */
-static inline int64_t PruneGBtoMiB(int gb) { return gb * GB_BYTES / 1024 / 1024; }
+static inline int64_t PruneGBtoMiB(int gb) { return gb * GB_BYTES / 1_MiB; }
 
 /** Interface from Qt to configuration data structure for Bitcoin client.
    To Qt, the options are presented as a list with the different options
@@ -48,7 +51,6 @@ public:
         StartAtStartup,         // bool
         ShowTrayIcon,           // bool
         MinimizeToTray,         // bool
-        MapPortUPnP,            // bool
         MapPortNatpmp,          // bool
         MinimizeOnClose,        // bool
         ProxyUse,               // bool
@@ -60,7 +62,7 @@ public:
         DisplayUnit,            // BitcoinUnit
         ThirdPartyTxUrls,       // QString
         Language,               // QString
-        UseEmbeddedMonospacedFont, // bool
+        FontForMoney,           // FontChoice
         CoinControlFeatures,    // bool
         SubFeeFromAmount,       // bool
         ThreadsScriptVerif,     // int
@@ -75,6 +77,14 @@ public:
         MaskValues,             // bool
         OptionIDRowCount,
     };
+
+    enum class FontChoiceAbstract {
+        EmbeddedFont,
+        BestSystemFont,
+    };
+    typedef std::variant<FontChoiceAbstract, QFont> FontChoice;
+    static inline const FontChoice UseBestSystemFont{FontChoiceAbstract::BestSystemFont};
+    static QFont getFontForChoice(const FontChoice& fc);
 
     bool Init(bilingual_str& error);
     void Reset();
@@ -93,7 +103,7 @@ public:
     bool getMinimizeOnClose() const { return fMinimizeOnClose; }
     BitcoinUnit getDisplayUnit() const { return m_display_bitcoin_unit; }
     QString getThirdPartyTxUrls() const { return strThirdPartyTxUrls; }
-    bool getUseEmbeddedMonospacedFont() const { return m_use_embedded_monospaced_font; }
+    QFont getFontForMoney() const;
     bool getCoinControlFeatures() const { return fCoinControlFeatures; }
     bool getSubFeeFromAmount() const { return m_sub_fee_from_amount; }
     bool getEnablePSBTControls() const { return m_enable_psbt_controls; }
@@ -120,7 +130,7 @@ private:
     QString language;
     BitcoinUnit m_display_bitcoin_unit;
     QString strThirdPartyTxUrls;
-    bool m_use_embedded_monospaced_font;
+    FontChoice m_font_money{FontChoiceAbstract::EmbeddedFont};
     bool fCoinControlFeatures;
     bool m_sub_fee_from_amount;
     bool m_enable_psbt_controls;
@@ -128,6 +138,9 @@ private:
 
     /* settings that were overridden by command-line */
     QString strOverriddenByCommandLine;
+
+    static QString FontChoiceToString(const OptionsModel::FontChoice&);
+    static FontChoice FontChoiceFromString(const QString&);
 
     // Add option to list of GUI options overridden through command line/config file
     void addOverriddenOption(const std::string &option);
@@ -139,7 +152,9 @@ Q_SIGNALS:
     void displayUnitChanged(BitcoinUnit unit);
     void coinControlFeaturesChanged(bool);
     void showTrayIconChanged(bool);
-    void useEmbeddedMonospacedFontChanged(bool);
+    void fontForMoneyChanged(const QFont&);
 };
+
+Q_DECLARE_METATYPE(OptionsModel::FontChoice)
 
 #endif // BITCOIN_QT_OPTIONSMODEL_H

@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2022 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -21,7 +21,7 @@
 #include <util/time.h>
 #include <validation.h>
 
-#include <stdint.h>
+#include <cstdint>
 
 #include <QDebug>
 #include <QMetaObject>
@@ -51,7 +51,7 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
     connect(timer, &QTimer::timeout, [this] {
         // no locking required at this point
         // the following calls will acquire the required lock
-        Q_EMIT mempoolSizeChanged(m_node.getMempoolSize(), m_node.getMempoolDynamicUsage());
+        Q_EMIT mempoolSizeChanged(m_node.getMempoolSize(), m_node.getMempoolDynamicUsage(), m_node.getMempoolMaxUsage());
         Q_EMIT bytesChanged(m_node.getTotalBytesRecv(), m_node.getTotalBytesSent());
     });
     connect(m_thread, &QThread::finished, timer, &QObject::deleteLater);
@@ -66,12 +66,17 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
     subscribeToCoreSignals();
 }
 
-ClientModel::~ClientModel()
+void ClientModel::stop()
 {
     unsubscribeFromCoreSignals();
 
     m_thread->quit();
     m_thread->wait();
+}
+
+ClientModel::~ClientModel()
+{
+    stop();
 }
 
 int ClientModel::getNumConnections(unsigned int flags) const
@@ -116,12 +121,10 @@ int64_t ClientModel::getHeaderTipTime() const
     return cachedBestHeaderTime;
 }
 
-int ClientModel::getNumBlocks() const
+
+std::map<CNetAddr, LocalServiceInfo> ClientModel::getNetLocalAddresses() const
 {
-    if (m_cached_num_blocks == -1) {
-        m_cached_num_blocks = m_node.getNumBlocks();
-    }
-    return m_cached_num_blocks;
+    return m_node.getNetLocalAddresses();
 }
 
 uint256 ClientModel::getBestBlockHash()
@@ -189,14 +192,9 @@ QString ClientModel::formatSubVersion() const
     return QString::fromStdString(strSubVersion);
 }
 
-bool ClientModel::isReleaseVersion() const
-{
-    return CLIENT_VERSION_IS_RELEASE;
-}
-
 QString ClientModel::formatClientStartupTime() const
 {
-    return QDateTime::fromSecsSinceEpoch(GetStartupTime()).toString();
+    return QDateTime::currentDateTime().addSecs(-TicksSeconds(GetUptime())).toString();
 }
 
 QString ClientModel::dataDir() const
@@ -216,7 +214,6 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
         cachedBestHeaderHeight = tip.block_height;
         cachedBestHeaderTime = tip.block_time;
     } else if (synctype == SyncType::BLOCK_SYNC) {
-        m_cached_num_blocks = tip.block_height;
         WITH_LOCK(m_cached_tip_mutex, m_cached_tip_blocks = tip.block_hash;);
     }
 
@@ -234,55 +231,50 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
 
 void ClientModel::subscribeToCoreSignals()
 {
-    m_handler_show_progress = m_node.handleShowProgress(
+    m_event_handlers.emplace_back(m_node.handleShowProgress(
         [this](const std::string& title, int progress, [[maybe_unused]] bool resume_possible) {
             Q_EMIT showProgress(QString::fromStdString(title), progress);
-        });
-    m_handler_notify_num_connections_changed = m_node.handleNotifyNumConnectionsChanged(
+        }));
+    m_event_handlers.emplace_back(m_node.handleNotifyNumConnectionsChanged(
         [this](int new_num_connections) {
             Q_EMIT numConnectionsChanged(new_num_connections);
-        });
-    m_handler_notify_network_active_changed = m_node.handleNotifyNetworkActiveChanged(
+        }));
+    m_event_handlers.emplace_back(m_node.handleNotifyNetworkActiveChanged(
         [this](bool network_active) {
             Q_EMIT networkActiveChanged(network_active);
-        });
-    m_handler_notify_alert_changed = m_node.handleNotifyAlertChanged(
+        }));
+    m_event_handlers.emplace_back(m_node.handleNotifyAlertChanged(
         [this]() {
             qDebug() << "ClientModel: NotifyAlertChanged";
             Q_EMIT alertsChanged(getStatusBarWarnings());
-        });
-    m_handler_banned_list_changed = m_node.handleBannedListChanged(
+        }));
+    m_event_handlers.emplace_back(m_node.handleBannedListChanged(
         [this]() {
             qDebug() << "ClienModel: Requesting update for peer banlist";
             QMetaObject::invokeMethod(banTableModel, [this] { banTableModel->refresh(); });
-        });
-    m_handler_notify_block_tip = m_node.handleNotifyBlockTip(
+        }));
+    m_event_handlers.emplace_back(m_node.handleNotifyBlockTip(
         [this](SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress) {
             TipChanged(sync_state, tip, verification_progress, SyncType::BLOCK_SYNC);
-        });
-    m_handler_notify_header_tip = m_node.handleNotifyHeaderTip(
+        }));
+    m_event_handlers.emplace_back(m_node.handleNotifyHeaderTip(
         [this](SynchronizationState sync_state, interfaces::BlockTip tip, bool presync) {
             TipChanged(sync_state, tip, /*verification_progress=*/0.0, presync ? SyncType::HEADER_PRESYNC : SyncType::HEADER_SYNC);
-        });
+        }));
 }
 
 void ClientModel::unsubscribeFromCoreSignals()
 {
-    m_handler_show_progress->disconnect();
-    m_handler_notify_num_connections_changed->disconnect();
-    m_handler_notify_network_active_changed->disconnect();
-    m_handler_notify_alert_changed->disconnect();
-    m_handler_banned_list_changed->disconnect();
-    m_handler_notify_block_tip->disconnect();
-    m_handler_notify_header_tip->disconnect();
+    m_event_handlers.clear();
 }
 
 bool ClientModel::getProxyInfo(std::string& ip_port) const
 {
-    Proxy ipv4, ipv6;
-    if (m_node.getProxy((Network) 1, ipv4) && m_node.getProxy((Network) 2, ipv6)) {
-      ip_port = ipv4.proxy.ToStringAddrPort();
-      return true;
+    const auto ipv4 = m_node.getProxy(NET_IPV4);
+    const auto ipv6 = m_node.getProxy(NET_IPV6);
+    if (ipv4 && ipv6) {
+        ip_port = ipv4->proxy.ToStringAddrPort();
+        return true;
     }
     return false;
 }

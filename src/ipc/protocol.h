@@ -1,4 +1,4 @@
-// Copyright (c) 2021 The Bitcoin Core developers
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,9 +6,12 @@
 #define BITCOIN_IPC_PROTOCOL_H
 
 #include <interfaces/init.h>
+#include <mp/util.h>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <typeindex>
 
 namespace ipc {
@@ -23,14 +26,43 @@ class Protocol
 public:
     virtual ~Protocol() = default;
 
-    //! Return Init interface that forwards requests over given socket descriptor.
-    //! Socket communication is handled on a background thread.
-    virtual std::unique_ptr<interfaces::Init> connect(int fd, const char* exe_name) = 0;
+    //! Return Init interface that forwards requests over given connection
+    //! stream. Socket communication is handled on a background thread.
+    //!
+    //! @note It could be potentially useful in the future to add
+    //! std::function<void()> on_disconnect callback argument here. But there
+    //! isn't an immediate need, because the protocol implementation can clean
+    //! up its own state (calling ProxyServer destructors, etc) on disconnect,
+    //! and any client calls will just throw ipc::Exception errors after a
+    //! disconnect.
+    virtual std::unique_ptr<interfaces::Init> connect(mp::Stream stream) = 0;
 
-    //! Handle requests on provided socket descriptor, forwarding them to the
-    //! provided Init interface. Socket communication is handled on the
-    //! current thread, and this call blocks until the socket is closed.
-    virtual void serve(int fd, const char* exe_name, interfaces::Init& init) = 0;
+    //! Listen for connections on provided socket id, accept them, and handle
+    //! requests on accepted connections. This method doesn't block, and
+    //! performs I/O on a background thread.
+    virtual void listen(mp::SocketId listen_fd, interfaces::Init& init, std::optional<size_t> max_connections = std::nullopt) = 0;
+
+    //! Handle requests from a stream provided by the make_stream callback,
+    //! forwarding them to the provided Init interface. Socket communication is
+    //! handled on the current thread, and this call blocks until the socket is
+    //! closed. A callback is used to specify the stream because this method
+    //! initializes the event loop and it may not be possible to create the
+    //! stream before the event loop is initialized.
+    //!
+    //! @note: If this method is called, it needs to be called before connect()
+    //! or listen() methods, because for ease of implementation this method is
+    //! inflexible and always runs the event loop in the foreground thread. It
+    //! can share its event loop with the other methods but can't share an event
+    //! loop that was created by them. This isn't a problem because serve() is
+    //! only called by spawned child processes that call it immediately to
+    //! communicate back with parent processes.
+    virtual void serve(interfaces::Init& init, const std::function<mp::Stream()>& make_stream) = 0;
+
+    //! Make stream object from socket id.
+    virtual mp::Stream makeStream(mp::SocketId socket) = 0;
+
+    //! Disconnect any incoming connections that are still connected.
+    virtual void disconnectIncoming() = 0;
 
     //! Add cleanup callback to interface that will run when the interface is
     //! deleted.

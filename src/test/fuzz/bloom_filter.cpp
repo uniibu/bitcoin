@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,23 +8,32 @@
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
 #include <uint256.h>
+#include <util/check.h>
 
-#include <cassert>
-#include <cstdint>
+#include <limits>
 #include <optional>
-#include <string>
 #include <vector>
 
 FUZZ_TARGET(bloom_filter)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
+    bool good_data{true};
 
+    const auto false_positive_rate{fuzzed_data_provider.ConsumeBool() ?
+        fuzzed_data_provider.ConsumeProbability<double>() :
+        fuzzed_data_provider.PickValueInArray({
+            0.0,
+            std::numeric_limits<double>::denorm_min(),
+            std::numeric_limits<double>::min(),
+            std::numeric_limits<double>::epsilon(),
+            1.0,
+        })};
     CBloomFilter bloom_filter{
-        fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(1, 10000000),
-        1.0 / fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(1, std::numeric_limits<unsigned int>::max()),
+        fuzzed_data_provider.ConsumeIntegral<unsigned int>(),
+        false_positive_rate,
         fuzzed_data_provider.ConsumeIntegral<unsigned int>(),
         static_cast<unsigned char>(fuzzed_data_provider.PickValueInArray({BLOOM_UPDATE_NONE, BLOOM_UPDATE_ALL, BLOOM_UPDATE_P2PUBKEY_ONLY, BLOOM_UPDATE_MASK}))};
-    LIMITED_WHILE(fuzzed_data_provider.remaining_bytes() > 0, 10000) {
+    LIMITED_WHILE (good_data && fuzzed_data_provider.remaining_bytes() > 0, 10'000) {
         CallOneOf(
             fuzzed_data_provider,
             [&] {
@@ -37,6 +46,7 @@ FUZZ_TARGET(bloom_filter)
             [&] {
                 const std::optional<COutPoint> out_point = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);
                 if (!out_point) {
+                    good_data = false;
                     return;
                 }
                 (void)bloom_filter.contains(*out_point);
@@ -47,6 +57,7 @@ FUZZ_TARGET(bloom_filter)
             [&] {
                 const std::optional<uint256> u256 = ConsumeDeserializable<uint256>(fuzzed_data_provider);
                 if (!u256) {
+                    good_data = false;
                     return;
                 }
                 (void)bloom_filter.contains(*u256);
@@ -55,8 +66,9 @@ FUZZ_TARGET(bloom_filter)
                 assert(present);
             },
             [&] {
-                const std::optional<CMutableTransaction> mut_tx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);
+                const std::optional<CMutableTransaction> mut_tx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider, TX_WITH_WITNESS);
                 if (!mut_tx) {
+                    good_data = false;
                     return;
                 }
                 const CTransaction tx{*mut_tx};

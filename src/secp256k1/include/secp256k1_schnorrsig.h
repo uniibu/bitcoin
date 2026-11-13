@@ -79,7 +79,7 @@ SECP256K1_API const secp256k1_nonce_function_hardened secp256k1_nonce_function_b
  *             secp256k1_nonce_function_bip340 is used, then ndata must be a
  *             pointer to 32-byte auxiliary randomness as per BIP-340.
  */
-typedef struct {
+typedef struct secp256k1_schnorrsig_extraparams {
     unsigned char magic[4];
     secp256k1_nonce_function_hardened noncefp;
     void *ndata;
@@ -124,20 +124,9 @@ SECP256K1_API int secp256k1_schnorrsig_sign32(
     const unsigned char *aux_rand32
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
 
-/** Same as secp256k1_schnorrsig_sign32, but DEPRECATED. Will be removed in
- *  future versions. */
-SECP256K1_API int secp256k1_schnorrsig_sign(
-    const secp256k1_context *ctx,
-    unsigned char *sig64,
-    const unsigned char *msg32,
-    const secp256k1_keypair *keypair,
-    const unsigned char *aux_rand32
-) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4)
-  SECP256K1_DEPRECATED("Use secp256k1_schnorrsig_sign32 instead");
-
 /** Create a Schnorr signature with a more flexible API.
  *
- *  Same arguments as secp256k1_schnorrsig_sign except that it allows signing
+ *  Same arguments as secp256k1_schnorrsig_sign32 except that it allows signing
  *  variable length messages and accepts a pointer to an extraparams object that
  *  allows customizing signing by passing additional arguments.
  *
@@ -169,11 +158,11 @@ SECP256K1_API int secp256k1_schnorrsig_sign_custom(
  *
  *  Returns: 1: correct signature
  *           0: incorrect signature
- *  Args:    ctx: a secp256k1 context object.
+ *  Args:    ctx: pointer to a context object.
  *  In:    sig64: pointer to the 64-byte signature to verify.
  *           msg: the message being verified. Can only be NULL if msglen is 0.
  *        msglen: length of the message
- *        pubkey: pointer to an x-only public key to verify with (cannot be NULL)
+ *        pubkey: pointer to an x-only public key to verify with
  */
 SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorrsig_verify(
     const secp256k1_context *ctx,

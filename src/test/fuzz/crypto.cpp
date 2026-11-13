@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -22,7 +22,9 @@ FUZZ_TARGET(crypto)
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     std::vector<uint8_t> data = ConsumeRandomLengthByteVector(fuzzed_data_provider);
     if (data.empty()) {
-        data.resize(fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 4096), fuzzed_data_provider.ConsumeIntegral<uint8_t>());
+        auto new_size = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 4096);
+        auto x = fuzzed_data_provider.ConsumeIntegral<uint8_t>();
+        data.resize(new_size, x);
     }
 
     CHash160 hash160;
@@ -36,15 +38,16 @@ FUZZ_TARGET(crypto)
     SHA3_256 sha3;
     CSipHasher sip_hasher{fuzzed_data_provider.ConsumeIntegral<uint64_t>(), fuzzed_data_provider.ConsumeIntegral<uint64_t>()};
 
-    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 30)
-    {
+    LIMITED_WHILE (fuzzed_data_provider.ConsumeBool(), 30) {
         CallOneOf(
             fuzzed_data_provider,
             [&] {
                 if (fuzzed_data_provider.ConsumeBool()) {
                     data = ConsumeRandomLengthByteVector(fuzzed_data_provider);
                     if (data.empty()) {
-                        data.resize(fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 4096), fuzzed_data_provider.ConsumeIntegral<uint8_t>());
+                        auto new_size = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 4096);
+                        auto x = fuzzed_data_provider.ConsumeIntegral<uint8_t>();
+                        data.resize(new_size, x);
                     }
                 }
 

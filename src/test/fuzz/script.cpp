@@ -1,6 +1,8 @@
-// Copyright (c) 2019-2022 The Bitcoin Core developers
+// Copyright (c) 2019-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <script/script.h>
 
 #include <chainparams.h>
 #include <compressor.h>
@@ -12,20 +14,19 @@
 #include <rpc/util.h>
 #include <script/descriptor.h>
 #include <script/interpreter.h>
-#include <script/script.h>
 #include <script/script_error.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <streams.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
 #include <univalue.h>
 #include <util/chaintype.h>
+#include <util/check.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -53,7 +54,7 @@ FUZZ_TARGET(script, .init = initialize_script)
     }
 
     TxoutType which_type;
-    bool is_standard_ret = IsStandard(script, std::nullopt, which_type);
+    bool is_standard_ret = IsStandard(script, which_type);
     if (!is_standard_ret) {
         assert(which_type == TxoutType::NONSTANDARD ||
                which_type == TxoutType::NULL_DATA ||
@@ -93,12 +94,6 @@ FUZZ_TARGET(script, .init = initialize_script)
     std::vector<std::vector<unsigned char>> solutions;
     (void)Solver(script, solutions);
 
-    (void)script.HasValidOps();
-    (void)script.IsPayToScriptHash();
-    (void)script.IsPayToWitnessScriptHash();
-    (void)script.IsPushOnly();
-    (void)script.GetSigOpCount(/* fAccurate= */ false);
-
     {
         const std::vector<uint8_t> bytes = ConsumeRandomLengthByteVector(fuzzed_data_provider);
         CompressedScript compressed_script;
@@ -117,14 +112,14 @@ FUZZ_TARGET(script, .init = initialize_script)
             (void)FindAndDelete(script_mut, *other_script);
         }
         const std::vector<std::string> random_string_vector = ConsumeRandomLengthStringVector(fuzzed_data_provider);
-        const uint32_t u32{fuzzed_data_provider.ConsumeIntegral<uint32_t>()};
-        const uint32_t flags{u32 | SCRIPT_VERIFY_P2SH};
+        const auto flags_rand{fuzzed_data_provider.ConsumeIntegral<script_verify_flags::value_type>()};
+        const auto flags = script_verify_flags::from_int(flags_rand) | SCRIPT_VERIFY_P2SH;
         {
             CScriptWitness wit;
             for (const auto& s : random_string_vector) {
                 wit.stack.emplace_back(s.begin(), s.end());
             }
-            (void)CountWitnessSigOps(script, *other_script, &wit, flags);
+            (void)CountWitnessSigOps(script, *other_script, wit, flags);
             wit.SetNull();
         }
     }
@@ -149,13 +144,16 @@ FUZZ_TARGET(script, .init = initialize_script)
         const CTxDestination tx_destination_2{ConsumeTxDestination(fuzzed_data_provider)};
         const std::string encoded_dest{EncodeDestination(tx_destination_1)};
         const UniValue json_dest{DescribeAddress(tx_destination_1)};
-        Assert(tx_destination_1 == DecodeDestination(encoded_dest));
         (void)GetKeyForDestination(/*store=*/{}, tx_destination_1);
         const CScript dest{GetScriptForDestination(tx_destination_1)};
         const bool valid{IsValidDestination(tx_destination_1)};
-        Assert(dest.empty() != valid);
 
-        Assert(valid == IsValidDestinationString(encoded_dest));
+        if (!std::get_if<PubKeyDestination>(&tx_destination_1)) {
+            // Only try to round trip non-pubkey destinations since PubKeyDestination has no encoding
+            Assert(dest.empty() != valid);
+            Assert(tx_destination_1 == DecodeDestination(encoded_dest));
+            Assert(valid == IsValidDestinationString(encoded_dest));
+        }
 
         (void)(tx_destination_1 < tx_destination_2);
         if (tx_destination_1 == tx_destination_2) {

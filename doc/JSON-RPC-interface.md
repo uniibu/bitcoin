@@ -33,10 +33,10 @@ requests when multiple wallets are in use.
 
 ```sh
 # Get block count from the / endpoint when rpcuser=alice and rpcport=38332
-$ curl --user alice --data-binary '{"jsonrpc": "1.0", "id": "0", "method": "getblockcount", "params": []}' -H 'content-type: text/plain;' localhost:38332/
+$ curl --user alice --data-binary '{"jsonrpc": "2.0", "id": "0", "method": "getblockcount", "params": []}' -H 'content-type: application/json' localhost:38332/
 
 # Get balance from the /wallet/walletname endpoint when rpcuser=alice, rpcport=38332 and rpcwallet=desc-wallet
-$ curl --user alice --data-binary '{"jsonrpc": "1.0", "id": "0", "method": "getbalance", "params": []}' -H 'content-type: text/plain;' localhost:38332/wallet/desc-wallet
+$ curl --user alice --data-binary '{"jsonrpc": "2.0", "id": "0", "method": "getbalance", "params": []}' -H 'content-type: application/json' localhost:38332/wallet/desc-wallet
 
 ```
 
@@ -62,6 +62,8 @@ bitcoin-cli -named createwallet wallet_name=mywallet load_on_startup=true
 bitcoin-cli -named createwallet mywallet load_on_startup=true
 ```
 
+`bitcoin rpc` can also be substituted for `bitcoin-cli -named`, and is a newer alternative.
+
 ## Versioning
 
 The RPC interface might change from one major version of Bitcoin Core to the
@@ -73,6 +75,22 @@ Usually deprecated features can be re-enabled during the grace-period of one
 major version via the `-deprecatedrpc=` command line option. The release notes
 of a new major release come with detailed instructions on what RPC features
 were deprecated and how to re-enable them temporarily.
+
+## JSON-RPC 1.1 vs 2.0
+
+The server recognizes [JSON-RPC v2.0](https://www.jsonrpc.org/specification) requests
+and responds accordingly. A 2.0 request is identified by the presence of
+`"jsonrpc": "2.0"` in the request body. If that key + value is not present in a request,
+the legacy JSON-RPC v1.1 protocol is followed instead, which was the only available
+protocol in v27.0 and prior releases.
+
+|| 1.1 | 2.0 |
+|-|-|-|
+| Request marker | `"version": "1.1"` (or none) | `"jsonrpc": "2.0"` |
+| Response marker | (none) | `"jsonrpc": "2.0"` |
+| `"error"` and `"result"` fields in response | both present | only one is present |
+| HTTP codes in response | `200` unless there is any kind of RPC error (invalid parameters, method not found, etc) | Always `200` unless there is an actual HTTP server error (request parsing error, endpoint not found, etc) |
+| Notifications: requests that get no reply | (not supported) | Supported for requests that exclude the "id" field. Returns HTTP status `204` "No Content" |
 
 ## Security
 
@@ -106,6 +124,22 @@ RPC interface will be abused.
   security-sensitive operations on a computer whose other programs you
   trust.
 
+- **RPC Credentials Security Boundary:** Any client with valid RPC credentials
+  should be treated as having significant control over both the Bitcoin Core node
+  and the filesystem resources accessible by the `bitcoind` process. RPC commands
+  can load wallet files from paths that the `bitcoind` process has permission to
+  access, specify file paths for operations, and potentially gain broader access
+  than intended. This means that someone with RPC access can potentially compromise
+  not only the Bitcoin Core node, but also the machine it is running on. Bitcoin Core
+  provides the `-rpcwhitelist` option to restrict which RPC commands specific users
+  can access, and `-rpcwhitelistdefault` to control the default behavior for users
+  without explicit whitelists. However, when using multiple wallets or sharing access
+  with different users, these should not be considered robust security boundaries, as
+  users with access to certain commands may still be able to exploit functionality in
+  unexpected ways. For security-sensitive operations, implement proper system-level
+  isolation (containers, virtualization, separate user accounts with restricted
+  permissions) rather than relying solely on RPC access controls.
+
 - **Securing remote network access:** You may optionally allow other
   computers to remotely control Bitcoin Core by setting the `rpcallowip`
   and `rpcbind` configuration parameters.  These settings are only meant
@@ -128,7 +162,7 @@ RPC interface will be abused.
     Instead, expose it only on the host system's localhost, for example:
     `-p 127.0.0.1:8332:8332`
 
-- **Secure authentication:** By default, Bitcoin Core generates unique
+- **Secure authentication:** By default, when no `rpcpassword` is specified, Bitcoin Core generates unique
   login credentials each time it restarts and puts them into a file
   readable only by the user that started Bitcoin Core, allowing any of
   that user's RPC clients with read access to the file to login

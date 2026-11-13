@@ -1,77 +1,68 @@
 #!/usr/bin/env python3
-# Copyright (c) 2021-2022 The Bitcoin Core developers
+# Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test that legacy txindex will be disabled on upgrade.
+"""Test txindex forward compatibility.
 
-Previous releases are required by this test, see test/README.md.
 """
 
-import os
 import shutil
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_raises_rpc_error
+from test_framework.util import assert_equal
 from test_framework.wallet import MiniWallet
 
-
-class TxindexCompatibilityTest(BitcoinTestFramework):
+class TxIndexTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
-        self.extra_args = [
-            ["-reindex", "-txindex"],
-            [],
-        ]
+        self.extra_args = [["-txindex"],["-txindex"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_previous_releases()
 
-    def setup_network(self):
+    def setup_nodes(self):
         self.add_nodes(
             self.num_nodes,
-            self.extra_args,
+            extra_args=self.extra_args,
             versions=[
-                160300,  # Last release with legacy txindex
-                None,  # For MiniWallet, without migration code
+                None,
+                280200,
             ],
         )
         self.start_nodes()
-        self.connect_nodes(0, 1)
 
     def run_test(self):
-        mini_wallet = MiniWallet(self.nodes[1])
-        spend_utxo = mini_wallet.get_utxo()
-        mini_wallet.send_self_transfer(from_node=self.nodes[1], utxo_to_spend=spend_utxo)
-        self.generate(self.nodes[1], 1)
+        self._test_txindex_compatibility()
 
-        self.log.info("Check legacy txindex")
-        assert_raises_rpc_error(-5, "Use -txindex", lambda: self.nodes[1].getrawtransaction(txid=spend_utxo["txid"]))
-        self.nodes[0].getrawtransaction(txid=spend_utxo["txid"])  # Requires -txindex
+    def _test_txindex_compatibility(self):
+        node = self.nodes[0]
+        legacy_node = self.nodes[1]
+        self.wallet = MiniWallet(self.nodes[0])
+        tx1 = self.wallet.send_self_transfer(from_node=self.nodes[0])
+        self.generate(self.nodes[0], 1)
+        txId1 = tx1['txid']
 
+        self.log.info("Ensure that queries to the txindex are consistent between the different index versions")
+        assert_equal(node.getrawtransaction(txId1), tx1['hex'])
+        assert_equal(legacy_node.getrawtransaction(txId1), tx1['hex'])
+
+        self.log.info("Exercise the new index running on a datadir with the old version")
         self.stop_nodes()
-        legacy_chain_dir = self.nodes[0].chain_path
+        self.cleanup_folder(node.chain_path)
+        shutil.copytree(legacy_node.chain_path, node.chain_path)
+        msg = "txindex contains entries in the legacy format"
+        with node.assert_debug_log(expected_msgs=[msg]):
+            self.start_node(0)
+        assert_equal(node.getrawtransaction(txId1), tx1['hex'])
 
-        self.log.info("Drop legacy txindex")
-        drop_index_chain_dir = self.nodes[1].chain_path
-        shutil.rmtree(drop_index_chain_dir)
-        shutil.copytree(legacy_chain_dir, drop_index_chain_dir)
-        self.nodes[1].assert_start_raises_init_error(
-            extra_args=["-txindex"],
-            expected_msg="Error: The block index db contains a legacy 'txindex'. To clear the occupied disk space, run a full -reindex, otherwise ignore this error. This error message will not be displayed again.",
-        )
-        # Build txindex from scratch and check there is no error this time
-        self.start_node(1, extra_args=["-txindex"])
-        self.wait_until(lambda: self.nodes[1].getindexinfo()["txindex"]["synced"] == True)
-        self.nodes[1].getrawtransaction(txid=spend_utxo["txid"])  # Requires -txindex
-
-        self.stop_nodes()
-
-        self.log.info("Check migrated txindex cannot be read by legacy node")
-        err_msg = f": You need to rebuild the database using -reindex to change -txindex.{os.linesep}Please restart with -reindex or -reindex-chainstate to recover."
-        shutil.rmtree(legacy_chain_dir)
-        shutil.copytree(drop_index_chain_dir, legacy_chain_dir)
-        self.nodes[0].assert_start_raises_init_error(extra_args=["-txindex"], expected_msg=err_msg)
+        self.log.info("Test that looking up a newly added transaction in a mixed-format db is possible")
+        tx2 = self.wallet.send_self_transfer(from_node=self.nodes[0])
+        self.generate(self.nodes[0], 1, sync_fun=self.no_op)
+        txId2 = tx2['txid']
+        self.wait_for_index_sync([node])
+        assert_equal(node.getrawtransaction(txId1), tx1['hex'])
+        assert_equal(node.getrawtransaction(txId2), tx2['hex'])
 
 
-if __name__ == "__main__":
-    TxindexCompatibilityTest().main()
+if __name__ == '__main__':
+    TxIndexTest(__file__).main()

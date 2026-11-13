@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2019-2022 The Bitcoin Core developers
+# Copyright (c) 2019-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test that we reject low difficulty headers to prevent our block tree from filling up with useless bloat"""
@@ -15,11 +15,15 @@ from test_framework.messages import (
 )
 
 from test_framework.blocktools import (
+    MAX_FUTURE_BLOCK_TIME,
     NORMAL_GBT_REQUEST_PARAMS,
     create_block,
 )
 
 from test_framework.util import assert_equal
+
+import re
+import time
 
 NODE1_BLOCKS_REQUIRED = 15
 NODE2_BLOCKS_REQUIRED = 2047
@@ -48,9 +52,17 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         self.connect_nodes(0, 2)
         self.connect_nodes(0, 3)
 
+    def mocktime_all(self, time):
+        for n in self.nodes:
+            n.setmocktime(time)
+
     def test_chains_sync_when_long_enough(self):
         self.log.info("Generate blocks on the node with no required chainwork, and verify nodes 1 and 2 have no new headers in their headers tree")
-        with self.nodes[1].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"]), self.nodes[2].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"]), self.nodes[3].assert_debug_log(expected_msgs=["Synchronizing blockheaders, height: 14"]):
+        with (
+                self.nodes[1].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"], timeout=2),
+                self.nodes[2].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"], timeout=2),
+                self.nodes[3].assert_debug_log(expected_msgs=["Synchronizing blockheaders, height: 14"], timeout=2),
+        ):
             self.generate(self.nodes[0], NODE1_BLOCKS_REQUIRED-1, sync_fun=self.no_op)
 
         # Node3 should always allow headers due to noban permissions
@@ -58,7 +70,7 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
         def check_node3_chaintips(num_tips, tip_hash, height):
             node3_chaintips = self.nodes[3].getchaintips()
-            assert len(node3_chaintips) == num_tips
+            assert_equal(len(node3_chaintips), num_tips)
             assert {
                 'height': height,
                 'hash': tip_hash,
@@ -70,7 +82,7 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
         for node in self.nodes[1:3]:
             chaintips = node.getchaintips()
-            assert len(chaintips) == 1
+            assert_equal(len(chaintips), 1)
             assert {
                 'height': 0,
                 'hash': '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206',
@@ -79,7 +91,10 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
             } in chaintips
 
         self.log.info("Generate more blocks to satisfy node1's minchainwork requirement, and verify node2 still has no new headers in headers tree")
-        with self.nodes[2].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=15)"]), self.nodes[3].assert_debug_log(expected_msgs=["Synchronizing blockheaders, height: 15"]):
+        with (
+                self.nodes[2].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=15)"], timeout=2),
+                self.nodes[3].assert_debug_log(expected_msgs=["Synchronizing blockheaders, height: 15"], timeout=2),
+        ):
             self.generate(self.nodes[0], NODE1_BLOCKS_REQUIRED - self.nodes[0].getblockcount(), sync_fun=self.no_op)
         self.sync_blocks(self.nodes[0:2]) # node3 will sync headers (noban permissions) but not blocks (due to minchainwork)
 
@@ -90,7 +105,7 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
             'status': 'active',
         } in self.nodes[2].getchaintips()
 
-        assert len(self.nodes[2].getchaintips()) == 1
+        assert_equal(len(self.nodes[2].getchaintips()), 1)
 
         self.log.info("Check that node3 accepted these headers as well")
         check_node3_chaintips(2, self.nodes[0].getbestblockhash(), NODE1_BLOCKS_REQUIRED)
@@ -123,13 +138,23 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
             block = create_block(hashprev = hashPrevBlock, tmpl=node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS))
             block.solve()
             new_blocks.append(block)
-            hashPrevBlock = block.sha256
+            hashPrevBlock = block.hash_int
 
         headers_message = msg_headers(headers=new_blocks)
         p2p.send_and_ping(headers_message)
 
         # getpeerinfo should show a sync in progress
         assert_equal(node.getpeerinfo()[0]['presynced_headers'], 2000)
+
+        self.log.info("Test whether a lagging clock aborts low-work headers sync")
+        node.disconnect_p2ps()
+        node.setmocktime(node.getblockheader(node.getblockhash(0))['mediantime'] - MAX_FUTURE_BLOCK_TIME - 1)
+        p2p = node.add_p2p_connection(P2PInterface())
+        p2p.send_without_ping(headers_message)
+        node.wait_until_stopped(expect_error=True, expected_ret_code=[-6,          # Unix
+                                                                      3,           # Windows native
+                                                                      0xC0000409], # Windows cross builds
+                                expected_stderr=re.compile("Failure when attempting to initiate headers sync: System clock"))
 
     def test_large_reorgs_can_succeed(self):
         self.log.info("Test that a 2000+ block reorg, starting from a point that is more than 2000 blocks before a locator entry, can succeed")
@@ -149,7 +174,9 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
         self.reconnect_all()
 
+        self.mocktime_all(int(time.time()))  # Temporarily hold time to avoid internal timeouts
         self.sync_blocks(timeout=300) # Ensure tips eventually agree
+        self.mocktime_all(0)
 
 
     def run_test(self):
@@ -162,4 +189,4 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
 
 if __name__ == '__main__':
-    RejectLowDifficultyHeadersTest().main()
+    RejectLowDifficultyHeadersTest(__file__).main()

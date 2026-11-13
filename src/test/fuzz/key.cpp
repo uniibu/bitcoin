@@ -1,9 +1,10 @@
-// Copyright (c) 2020-2022 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <chainparams.h>
 #include <key.h>
+
+#include <chainparams.h>
 #include <key_io.h>
 #include <outputtype.h>
 #include <policy/policy.h>
@@ -13,15 +14,17 @@
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <streams.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
+#include <test/fuzz/util.h>
+#include <test/util/random.h>
 #include <util/chaintype.h>
+#include <util/check.h>
 #include <util/strencodings.h>
 
 #include <array>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
@@ -31,12 +34,13 @@
 
 void initialize_key()
 {
-    ECC_Start();
+    static ECC_Context ecc_context{};
     SelectParams(ChainType::REGTEST);
 }
 
 FUZZ_TARGET(key, .init = initialize_key)
 {
+    SeedRandomStateForTest(SeedRand::ZEROS);
     const CKey key = [&] {
         CKey k;
         k.Set(buffer.begin(), buffer.end(), true);
@@ -77,22 +81,12 @@ FUZZ_TARGET(key, .init = initialize_key)
         assert(copied_key == key);
     }
 
-    {
-        CKey negated_key = key;
-        negated_key.Negate();
-        assert(negated_key.IsValid());
-        assert(!(negated_key == key));
-
-        negated_key.Negate();
-        assert(negated_key == key);
-    }
-
     const uint256 random_uint256 = Hash(buffer);
 
     {
         CKey child_key;
         ChainCode child_chaincode;
-        const bool ok = key.Derive(child_key, child_chaincode, 0, random_uint256);
+        const bool ok = key.Derive(child_key, child_chaincode, 0, ChainCode{random_uint256});
         assert(ok);
         assert(child_key.IsValid());
         assert(!(child_key == key));
@@ -111,7 +105,6 @@ FUZZ_TARGET(key, .init = initialize_key)
         assert(pubkey.IsValid());
         assert(pubkey.IsFullyValid());
         assert(HexToPubKey(HexStr(pubkey)) == pubkey);
-        assert(GetAllDestinationsForKey(pubkey).size() == 3);
     }
 
     {
@@ -158,12 +151,12 @@ FUZZ_TARGET(key, .init = initialize_key)
         assert(fillable_signing_provider_pub.HaveKey(pubkey.GetID()));
 
         TxoutType which_type_tx_pubkey;
-        const bool is_standard_tx_pubkey = IsStandard(tx_pubkey_script, std::nullopt, which_type_tx_pubkey);
+        const bool is_standard_tx_pubkey = IsStandard(tx_pubkey_script, which_type_tx_pubkey);
         assert(is_standard_tx_pubkey);
         assert(which_type_tx_pubkey == TxoutType::PUBKEY);
 
         TxoutType which_type_tx_multisig;
-        const bool is_standard_tx_multisig = IsStandard(tx_multisig_script, std::nullopt, which_type_tx_multisig);
+        const bool is_standard_tx_multisig = IsStandard(tx_multisig_script, which_type_tx_multisig);
         assert(is_standard_tx_multisig);
         assert(which_type_tx_multisig == TxoutType::MULTISIG);
 
@@ -182,19 +175,16 @@ FUZZ_TARGET(key, .init = initialize_key)
         assert(v_solutions_ret_tx_multisig[2].size() == 1);
 
         OutputType output_type{};
-        const CTxDestination tx_destination = GetDestinationForKey(pubkey, output_type);
+        const CTxDestination tx_destination{PKHash{pubkey}};
         assert(output_type == OutputType::LEGACY);
         assert(IsValidDestination(tx_destination));
-        assert(CTxDestination{PKHash{pubkey}} == tx_destination);
+        assert(PKHash{pubkey} == *std::get_if<PKHash>(&tx_destination));
 
         const CScript script_for_destination = GetScriptForDestination(tx_destination);
         assert(script_for_destination.size() == 25);
 
         const std::string destination_address = EncodeDestination(tx_destination);
         assert(DecodeDestination(destination_address) == tx_destination);
-
-        const CPubKey pubkey_from_address_string = AddrToPubKey(fillable_signing_provider, destination_address);
-        assert(pubkey_from_address_string == pubkey);
 
         CKeyID key_id = pubkey.GetID();
         assert(!key_id.IsNull());
@@ -286,7 +276,7 @@ FUZZ_TARGET(key, .init = initialize_key)
     {
         CPubKey child_pubkey;
         ChainCode child_chaincode;
-        const bool ok = pubkey.Derive(child_pubkey, child_chaincode, 0, random_uint256);
+        const bool ok = pubkey.Derive(child_pubkey, child_chaincode, 0, ChainCode{random_uint256});
         assert(ok);
         assert(child_pubkey != pubkey);
         assert(child_pubkey.IsCompressed());
@@ -312,10 +302,7 @@ FUZZ_TARGET(ellswift_roundtrip, .init = initialize_key)
 {
     FuzzedDataProvider fdp{buffer.data(), buffer.size()};
 
-    auto key_bytes = fdp.ConsumeBytes<uint8_t>(32);
-    key_bytes.resize(32);
-    CKey key;
-    key.Set(key_bytes.begin(), key_bytes.end(), true);
+    CKey key = ConsumePrivateKey(fdp, /*compressed=*/true);
     if (!key.IsValid()) return;
 
     auto ent32 = fdp.ConsumeBytes<std::byte>(32);
@@ -324,7 +311,10 @@ FUZZ_TARGET(ellswift_roundtrip, .init = initialize_key)
     auto encoded_ellswift = key.EllSwiftCreate(ent32);
     auto decoded_pubkey = encoded_ellswift.Decode();
 
-    assert(key.VerifyPubKey(decoded_pubkey));
+    uint256 hash{ConsumeUInt256(fdp)};
+    std::vector<unsigned char> sig;
+    key.Sign(hash, sig);
+    assert(decoded_pubkey.Verify(hash, sig));
 }
 
 FUZZ_TARGET(bip324_ecdh, .init = initialize_key)
@@ -332,17 +322,11 @@ FUZZ_TARGET(bip324_ecdh, .init = initialize_key)
     FuzzedDataProvider fdp{buffer.data(), buffer.size()};
 
     // We generate private key, k1.
-    auto rnd32 = fdp.ConsumeBytes<uint8_t>(32);
-    rnd32.resize(32);
-    CKey k1;
-    k1.Set(rnd32.begin(), rnd32.end(), true);
+    CKey k1 = ConsumePrivateKey(fdp, /*compressed=*/true);
     if (!k1.IsValid()) return;
 
     // They generate private key, k2.
-    rnd32 = fdp.ConsumeBytes<uint8_t>(32);
-    rnd32.resize(32);
-    CKey k2;
-    k2.Set(rnd32.begin(), rnd32.end(), true);
+    CKey k2 = ConsumePrivateKey(fdp, /*compressed=*/true);
     if (!k2.IsValid()) return;
 
     // We construct an ellswift encoding for our key, k1_ellswift.

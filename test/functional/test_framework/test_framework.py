@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2014-2022 The Bitcoin Core developers
+# Copyright (c) 2014-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Base class for RPC testing."""
@@ -7,33 +7,42 @@
 import configparser
 from enum import Enum
 import argparse
+from datetime import datetime, timezone
+from importlib.util import find_spec
 import logging
 import os
+from pathlib import Path
 import platform
 import pdb
 import random
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
-from typing import List
 from .address import create_deterministic_address_bcrt1_p2tr_op_true
-from .authproxy import JSONRPCException
 from . import coverage
+from .messages import CAddress
 from .p2p import NetworkThread
 from .test_node import TestNode
 from .util import (
+    Binaries,
     MAX_NODES,
     PortSeed,
     assert_equal,
     check_json_precision,
+    export_env_build_path,
+    find_vout_for_address,
+    get_binary_paths,
     get_datadir_path,
     initialize_datadir,
     p2p_port,
-    wait_until_helper,
+    wait_until_helper_internal,
+    wallet_importprivkey,
+    JSONRPCException,
 )
 
 
@@ -92,18 +101,20 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
     This class also contains various public and private helper methods."""
 
-    def __init__(self) -> None:
+    def __init__(self, test_file) -> None:
         """Sets test framework defaults. Do not override this method. Instead, override the set_test_params() method"""
         self.chain: str = 'regtest'
         self.setup_clean_chain: bool = False
-        self.nodes: List[TestNode] = []
+        self.noban_tx_relay: bool = False
+        self.nodes: list[TestNode] = []
         self.extra_args = None
+        self.extra_init = None
         self.network_thread = None
         self.rpc_timeout = 60  # Wait for up to 60 seconds for the RPC server to respond
         self.supports_cli = True
         self.bind_to_localhost_only = True
-        self.parse_args()
-        self.default_wallet_name = "default_wallet" if self.options.descriptors else ""
+        self.parse_args(test_file)
+        self.default_wallet_name = "default_wallet"
         self.wallet_data_filename = "wallet.dat"
         # Optional list of wallet names that can be set in set_test_params to
         # create and import keys to. If unset, default is len(nodes) *
@@ -112,8 +123,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         # are not imported.
         self.wallet_names = None
         # By default the wallet is not required. Set to true by skip_if_no_wallet().
-        # When False, we ignore wallet_names regardless of what it is.
-        self._requires_wallet = False
+        # Can also be set to None to indicate that the wallet will be used if available.
+        # When False or None, we ignore wallet_names in setup_nodes().
+        self.uses_wallet = False
         # Disable ThreadOpenConnections by default, so that adding entries to
         # addrman will not result in automatic connections to them.
         self.disable_autoconnect = True
@@ -128,42 +140,41 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
         try:
             self.setup()
-            self.run_test()
-        except JSONRPCException:
-            self.log.exception("JSONRPC error")
-            self.success = TestStatus.FAILED
+            if self.options.test_methods:
+                self.run_test_methods()
+            else:
+                self.run_test()
+
         except SkipTest as e:
             self.log.warning("Test Skipped: %s" % e.message)
             self.success = TestStatus.SKIPPED
-        except AssertionError:
-            self.log.exception("Assertion failed")
-            self.success = TestStatus.FAILED
-        except KeyError:
-            self.log.exception("Key error")
-            self.success = TestStatus.FAILED
         except subprocess.CalledProcessError as e:
-            self.log.exception("Called Process failed with '{}'".format(e.output))
+            self.log.exception(f"Called Process failed with stdout='{e.stdout}'; stderr='{e.stderr}';")
             self.success = TestStatus.FAILED
-        except Exception:
-            self.log.exception("Unexpected exception caught during testing")
-            self.success = TestStatus.FAILED
-        except KeyboardInterrupt:
-            self.log.warning("Exiting after keyboard interrupt")
+        except BaseException:
+            # The `exception` log will add the exception info to the message.
+            # https://docs.python.org/3/library/logging.html#logging.exception
+            self.log.exception("Unexpected exception:")
             self.success = TestStatus.FAILED
         finally:
             exit_code = self.shutdown()
             sys.exit(exit_code)
 
-    def parse_args(self):
+    def run_test_methods(self):
+        for method_name in self.options.test_methods:
+            self.log.info(f"Attempting to execute method: {method_name}")
+            method = getattr(self, method_name)
+            method()
+            self.log.info(f"Method '{method_name}' executed successfully.")
+
+    def parse_args(self, test_file):
         previous_releases_path = os.getenv("PREVIOUS_RELEASES_DIR") or os.getcwd() + "/releases"
         parser = argparse.ArgumentParser(usage="%(prog)s [options]")
         parser.add_argument("--nocleanup", dest="nocleanup", default=False, action="store_true",
                             help="Leave bitcoinds and test.* datadir on exit or error")
-        parser.add_argument("--noshutdown", dest="noshutdown", default=False, action="store_true",
-                            help="Don't stop bitcoinds after the test execution")
-        parser.add_argument("--cachedir", dest="cachedir", default=os.path.abspath(os.path.dirname(os.path.realpath(__file__)) + "/../../cache"),
+        parser.add_argument("--cachedir", dest="cachedir", default=os.path.abspath(os.path.dirname(test_file) + "/../cache"),
                             help="Directory for caching pregenerated datadirs (default: %(default)s)")
-        parser.add_argument("--tmpdir", dest="tmpdir", help="Root directory for datadirs")
+        parser.add_argument("--tmpdir", dest="tmpdir", help="Root directory for datadirs (must not exist)")
         parser.add_argument("-l", "--loglevel", dest="loglevel", default="INFO",
                             help="log events at this level and higher to the console. Can be set to DEBUG, INFO, WARNING, ERROR or CRITICAL. Passing --loglevel DEBUG will output all logs to console. Note that logs at all levels are always written to the test_framework.log file in the temporary test directory.")
         parser.add_argument("--tracerpc", dest="trace_rpc", default=False, action="store_true",
@@ -172,23 +183,27 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                             help="The seed to use for assigning port numbers (default: current process id)")
         parser.add_argument("--previous-releases", dest="prev_releases", action="store_true",
                             default=os.path.isdir(previous_releases_path) and bool(os.listdir(previous_releases_path)),
-                            help="Force test of previous releases (default: %(default)s)")
+                            help="Force test of previous releases (default: %(default)s). Previous releases binaries can be downloaded via `test/get_previous_releases.py`.")
         parser.add_argument("--coveragedir", dest="coveragedir",
                             help="Write tested RPC commands into this directory")
         parser.add_argument("--configfile", dest="configfile",
-                            default=os.path.abspath(os.path.dirname(os.path.realpath(__file__)) + "/../../config.ini"),
+                            default=os.path.abspath(os.path.dirname(test_file) + "/../config.ini"),
                             help="Location of the test framework config file (default: %(default)s)")
         parser.add_argument("--pdbonfailure", dest="pdbonfailure", default=False, action="store_true",
                             help="Attach a python debugger if test fails")
         parser.add_argument("--usecli", dest="usecli", default=False, action="store_true",
                             help="use bitcoin-cli instead of RPC for all commands")
-        parser.add_argument("--perf", dest="perf", default=False, action="store_true",
-                            help="profile running nodes with perf for the duration of the test")
         parser.add_argument("--valgrind", dest="valgrind", default=False, action="store_true",
-                            help="run nodes under the valgrind memory error detector: expect at least a ~10x slowdown. valgrind 3.14 or later required.")
+                            help="Run binaries under the valgrind memory error detector: Expect at least a ~10x slowdown. Does not apply to previous release binaries.")
         parser.add_argument("--randomseed", type=int,
                             help="set a random seed for deterministically reproducing a previous test run")
         parser.add_argument("--timeout-factor", dest="timeout_factor", type=float, help="adjust test timeouts by a factor. Setting it to 0 disables all timeouts")
+        parser.add_argument("--v2transport", dest="v2transport", default=False, action="store_true",
+                            help="use BIP324 v2 connections between all nodes by default")
+        parser.add_argument("--v1transport", dest="v1transport", default=False, action="store_true",
+                            help="Explicitly use v1 transport (can be used to overwrite global --v2transport option)")
+        parser.add_argument("--test_methods", dest="test_methods", nargs='*',
+                            help="Run specified test methods sequentially instead of the full test. Use only for methods that do not depend on any context set up in run_test or other methods.")
 
         self.add_options(parser)
         # Running TestShell in a Jupyter notebook causes an additional -f argument
@@ -197,66 +212,32 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         parser.add_argument("-f", "--fff", help="a dummy argument to fool ipython", default="1")
         self.options = parser.parse_args()
         if self.options.timeout_factor == 0:
-            self.options.timeout_factor = 99999
+            self.options.timeout_factor = 999
         self.options.timeout_factor = self.options.timeout_factor or (4 if self.options.valgrind else 1)
         self.options.previous_releases_path = previous_releases_path
 
-        config = configparser.ConfigParser()
-        config.read_file(open(self.options.configfile))
-        self.config = config
-
-        if "descriptors" not in self.options:
-            # Wallet is not required by the test at all and the value of self.options.descriptors won't matter.
-            # It still needs to exist and be None in order for tests to work however.
-            # So set it to None to force -disablewallet, because the wallet is not needed.
-            self.options.descriptors = None
-        elif self.options.descriptors is None:
-            # Some wallet is either required or optionally used by the test.
-            # Prefer SQLite unless it isn't available
-            if self.is_sqlite_compiled():
-                self.options.descriptors = True
-            elif self.is_bdb_compiled():
-                self.options.descriptors = False
-            else:
-                # If neither are compiled, tests requiring a wallet will be skipped and the value of self.options.descriptors won't matter
-                # It still needs to exist and be None in order for tests to work however.
-                # So set it to None, which will also set -disablewallet.
-                self.options.descriptors = None
+        self.config = configparser.ConfigParser()
+        self.config.read_file(open(self.options.configfile))
+        self.binary_paths = get_binary_paths(self.config)
+        if self.options.v1transport:
+            self.options.v2transport=False
 
         PortSeed.n = self.options.port_seed
 
-    def set_binary_paths(self):
-        """Update self.options with the paths of all binaries from environment variables or their default values"""
-
-        binaries = {
-            "bitcoind": ("bitcoind", "BITCOIND"),
-            "bitcoin-cli": ("bitcoincli", "BITCOINCLI"),
-            "bitcoin-util": ("bitcoinutil", "BITCOINUTIL"),
-            "bitcoin-wallet": ("bitcoinwallet", "BITCOINWALLET"),
-        }
-        for binary, [attribute_name, env_variable_name] in binaries.items():
-            default_filename = os.path.join(
-                self.config["environment"]["BUILDDIR"],
-                "src",
-                binary + self.config["environment"]["EXEEXT"],
-            )
-            setattr(self.options, attribute_name, os.getenv(env_variable_name, default=default_filename))
+    def get_binaries(self, bin_dir=None):
+        return Binaries(self.binary_paths, bin_dir, use_valgrind=self.options.valgrind)
 
     def setup(self):
         """Call this method to start up the test framework object with options set."""
 
         check_json_precision()
+        export_env_build_path(self.config)
+
+        sanitizer_env = runpy.run_path(Path(self.config["environment"]["BUILDDIR"]) / "test" / "with_sanitizer_env.py", )["sanitizer_env"]
+        for name, value in sanitizer_env().items():
+            os.environ.setdefault(name, value)
 
         self.options.cachedir = os.path.abspath(self.options.cachedir)
-
-        config = self.config
-
-        self.set_binary_paths()
-
-        os.environ['PATH'] = os.pathsep.join([
-            os.path.join(config['environment']['BUILDDIR'], 'src'),
-            os.path.join(config['environment']['BUILDDIR'], 'src', 'qt'), os.environ['PATH']
-        ])
 
         # Set up temp directory and start logging
         if self.options.tmpdir:
@@ -285,6 +266,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         self.log.debug('Setting up network thread')
         self.network_thread = NetworkThread()
         self.network_thread.start()
+        self.wait_until(lambda: self.network_thread.network_event_loop is not None and self.network_thread.network_event_loop.is_running())
 
         if self.options.usecli:
             if not self.supports_cli:
@@ -304,28 +286,21 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             pdb.set_trace()
 
         self.log.debug('Closing down network thread')
-        self.network_thread.close()
-        if not self.options.noshutdown:
+        self.network_thread.close(timeout=self.options.timeout_factor * 10)
+        if self.success == TestStatus.FAILED:
+            self.log.info("Not stopping nodes as test failed. The dangling processes will be cleaned up later.")
+        else:
             self.log.info("Stopping nodes")
             if self.nodes:
                 self.stop_nodes()
-        else:
-            for node in self.nodes:
-                node.cleanup_on_exit = False
-            self.log.info("Note: bitcoinds were not stopped and may still be running")
 
         should_clean_up = (
             not self.options.nocleanup and
-            not self.options.noshutdown and
-            self.success != TestStatus.FAILED and
-            not self.options.perf
+            self.success != TestStatus.FAILED
         )
         if should_clean_up:
             self.log.info("Cleaning up {} on exit".format(self.options.tmpdir))
             cleanup_tree_on_exit = True
-        elif self.options.perf:
-            self.log.warning("Not cleaning up dir {} due to perf data".format(self.options.tmpdir))
-            cleanup_tree_on_exit = False
         else:
             self.log.warning("Not cleaning up dir {}".format(self.options.tmpdir))
             cleanup_tree_on_exit = False
@@ -342,7 +317,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             self.log.error("Hint: Call {} '{}' to consolidate all logs".format(os.path.normpath(os.path.dirname(os.path.realpath(__file__)) + "/../combine_logs.py"), self.options.tmpdir))
             self.log.error("")
             self.log.error("If this failure happened unexpectedly or intermittently, please file a bug and provide a link or upload of the combined log.")
-            self.log.error(self.config['environment']['PACKAGE_BUGREPORT'])
+            self.log.error(self.config['environment']['CLIENT_BUGREPORT'])
             self.log.error("")
             exit_code = TEST_EXIT_FAILED
         # Logging.shutdown will not remove stream- and filehandlers, so we must
@@ -358,7 +333,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             h.flush()
             rpc_logger.removeHandler(h)
         if cleanup_tree_on_exit:
-            shutil.rmtree(self.options.tmpdir)
+            self.cleanup_folder(self.options.tmpdir)
 
         self.nodes.clear()
         return exit_code
@@ -409,7 +384,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         """Override this method to customize test node setup"""
         self.add_nodes(self.num_nodes, self.extra_args)
         self.start_nodes()
-        if self._requires_wallet:
+        if self.uses_wallet:
             self.import_deterministic_coinbase_privkeys()
         if not self.setup_clean_chain:
             for n in self.nodes:
@@ -430,12 +405,13 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             self.init_wallet(node=i)
 
     def init_wallet(self, *, node):
+        """Refer to the self.wallet_names docstring on how to use this"""
         wallet_name = self.default_wallet_name if self.wallet_names is None else self.wallet_names[node] if node < len(self.wallet_names) else False
         if wallet_name is not False:
             n = self.nodes[node]
             if wallet_name is not None:
-                n.createwallet(wallet_name=wallet_name, descriptors=self.options.descriptors, load_on_startup=True)
-            n.importprivkey(privkey=n.get_deterministic_priv_key().key, label='coinbase', rescan=True)
+                n.createwallet(wallet_name=wallet_name, load_on_startup=True)
+            wallet_importprivkey(n.get_wallet_rpc(wallet_name), n.get_deterministic_priv_key().key, 0, label="coinbase")
 
     def run_test(self):
         """Tests must override this method to define test logic"""
@@ -443,29 +419,14 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
     # Public helper methods. These can be accessed by the subclass test scripts.
 
-    def add_wallet_options(self, parser, *, descriptors=True, legacy=True):
-        kwargs = {}
-        if descriptors + legacy == 1:
-            # If only one type can be chosen, set it as default
-            kwargs["default"] = descriptors
-        group = parser.add_mutually_exclusive_group(
-            # If only one type is allowed, require it to be set in test_runner.py
-            required=os.getenv("REQUIRE_WALLET_TYPE_SET") == "1" and "default" in kwargs)
-        if descriptors:
-            group.add_argument("--descriptors", action='store_const', const=True, **kwargs,
-                               help="Run test using a descriptor wallet", dest='descriptors')
-        if legacy:
-            group.add_argument("--legacy-wallet", action='store_const', const=False, **kwargs,
-                               help="Run test using legacy wallets", dest='descriptors')
-
-    def add_nodes(self, num_nodes: int, extra_args=None, *, rpchost=None, binary=None, binary_cli=None, versions=None):
+    def add_nodes(self, num_nodes: int, extra_args=None, *, rpchost=None, versions=None):
         """Instantiate TestNode objects.
 
         Should only be called once after the nodes have been specified in
         set_test_params()."""
-        def get_bin_from_version(version, bin_name, bin_default):
+        def bin_dir_from_version(version):
             if not version:
-                return bin_default
+                return None
             if version > 219999:
                 # Starting at client version 220000 the first two digits represent
                 # the major version, e.g. v22.0 instead of v0.22.0.
@@ -483,7 +444,6 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                     ),
                 ),
                 'bin',
-                bin_name,
             )
 
         if self.bind_to_localhost_only:
@@ -492,72 +452,74 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             extra_confs = [[]] * num_nodes
         if extra_args is None:
             extra_args = [[]] * num_nodes
+        # Use noban permission to speed up tx relay / mempool sync. Don't use it if testing tx relay or timing.
+        if self.noban_tx_relay:
+            extra_confs = [conf + ["whitelist=noban,in,out@127.0.0.1"] for conf in extra_confs]
         if versions is None:
             versions = [None] * num_nodes
-        if binary is None:
-            binary = [get_bin_from_version(v, 'bitcoind', self.options.bitcoind) for v in versions]
-        if binary_cli is None:
-            binary_cli = [get_bin_from_version(v, 'bitcoin-cli', self.options.bitcoincli) for v in versions]
+        bin_dirs = []
+        for v in versions:
+            bin_dir = bin_dir_from_version(v)
+            bin_dirs.append(bin_dir)
+
+        extra_init = [{}] * num_nodes if self.extra_init is None else self.extra_init # type: ignore[var-annotated]
+        assert_equal(len(extra_init), num_nodes)
         assert_equal(len(extra_confs), num_nodes)
         assert_equal(len(extra_args), num_nodes)
         assert_equal(len(versions), num_nodes)
-        assert_equal(len(binary), num_nodes)
-        assert_equal(len(binary_cli), num_nodes)
+        assert_equal(len(bin_dirs), num_nodes)
         for i in range(num_nodes):
-            test_node_i = TestNode(
-                i,
-                get_datadir_path(self.options.tmpdir, i),
+            args = list(extra_args[i])
+            init = dict(
                 chain=self.chain,
                 rpchost=rpchost,
                 timewait=self.rpc_timeout,
                 timeout_factor=self.options.timeout_factor,
-                bitcoind=binary[i],
-                bitcoin_cli=binary_cli[i],
+                binaries=self.get_binaries(bin_dirs[i]),
                 version=versions[i],
                 coverage_dir=self.options.coveragedir,
                 cwd=self.options.tmpdir,
                 extra_conf=extra_confs[i],
-                extra_args=extra_args[i],
+                extra_args=args,
                 use_cli=self.options.usecli,
-                start_perf=self.options.perf,
-                use_valgrind=self.options.valgrind,
-                descriptors=self.options.descriptors,
+                v2transport=self.options.v2transport,
+                uses_wallet=self.uses_wallet,
             )
+            init.update(extra_init[i])
+            test_node_i = TestNode(
+                i,
+                get_datadir_path(self.options.tmpdir, i),
+                **init)
             self.nodes.append(test_node_i)
             if not test_node_i.version_is_at_least(170000):
                 # adjust conf for pre 17
                 test_node_i.replace_in_config([('[regtest]', '')])
 
-    def start_node(self, i, *args, **kwargs):
+    def start_node(self, i, *args, wait_for_full_init=True, **kwargs):
         """Start a bitcoind"""
 
         node = self.nodes[i]
 
         node.start(*args, **kwargs)
-        node.wait_for_rpc_connection()
+        node.wait_for_rpc_connection(wait_for_full_init=wait_for_full_init)
 
         if self.options.coveragedir is not None:
-            coverage.write_all_rpc_commands(self.options.coveragedir, node.rpc)
+            coverage.write_all_rpc_commands(self.options.coveragedir, node._rpc)
 
-    def start_nodes(self, extra_args=None, *args, **kwargs):
+    def start_nodes(self, extra_args=None, *args, wait_for_full_init=True, **kwargs):
         """Start multiple bitcoinds"""
 
         if extra_args is None:
             extra_args = [None] * self.num_nodes
         assert_equal(len(extra_args), self.num_nodes)
-        try:
-            for i, node in enumerate(self.nodes):
-                node.start(extra_args[i], *args, **kwargs)
-            for node in self.nodes:
-                node.wait_for_rpc_connection()
-        except Exception:
-            # If one node failed to start, stop the others
-            self.stop_nodes()
-            raise
+        for i, node in enumerate(self.nodes):
+            node.start(extra_args[i], *args, **kwargs)
+        for node in self.nodes:
+            node.wait_for_rpc_connection(wait_for_full_init=wait_for_full_init)
 
         if self.options.coveragedir is not None:
             for node in self.nodes:
-                coverage.write_all_rpc_commands(self.options.coveragedir, node.rpc)
+                coverage.write_all_rpc_commands(self.options.coveragedir, node._rpc)
 
     def stop_node(self, i, expected_stderr='', wait=0):
         """Stop a bitcoind test node"""
@@ -573,34 +535,82 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             # Wait for nodes to stop
             node.wait_until_stopped()
 
-    def restart_node(self, i, extra_args=None):
+    def cleanup_partially_started_nodes(self):
+        """Tear down nodes left running after a failed start_nodes().
+
+        After start_nodes() raises (e.g. FailedToStartError), some nodes may be
+        RPC-connected, some may have a live process without RPC, and some may
+        already have exited. Stop the connected ones cleanly and force-kill the
+        rest so the framework's teardown can proceed.
+        """
+        for node in self.nodes:
+            if not node.running:
+                continue
+            if node.rpc_connected:
+                node.stop_node(wait=node.rpc_timeout)
+            else:
+                node.process.kill()
+                node.process.wait(timeout=node.rpc_timeout)
+                node.process = None
+                node.stdout.close()
+                node.stderr.close()
+                node.running = False
+
+    def restart_node(self, i, extra_args=None, clear_addrman=False, *, expected_stderr='', wait_for_full_init=True):
         """Stop and start a test node"""
-        self.stop_node(i)
-        self.start_node(i, extra_args)
+        self.stop_node(i, expected_stderr=expected_stderr)
+        if clear_addrman:
+            peers_dat = self.nodes[i].chain_path / "peers.dat"
+            os.remove(peers_dat)
+            with self.nodes[i].assert_debug_log(expected_msgs=[f'Creating peers.dat because the file was not found ("{peers_dat}")']):
+                self.start_node(i, extra_args, wait_for_full_init=wait_for_full_init)
+        else:
+            self.start_node(i, extra_args, wait_for_full_init=wait_for_full_init)
 
     def wait_for_node_exit(self, i, timeout):
         self.nodes[i].process.wait(timeout)
 
-    def connect_nodes(self, a, b):
+    def connect_nodes(self, a, b, *, peer_advertises_v2=None):
         from_connection = self.nodes[a]
         to_connection = self.nodes[b]
-        from_num_peers = 1 + len(from_connection.getpeerinfo())
-        to_num_peers = 1 + len(to_connection.getpeerinfo())
+
+        # Use subversion as peer id. Test nodes have their node number appended to the user agent string
+        from_connection_subver = from_connection.getnetworkinfo()['subversion']
+        to_connection_subver = to_connection.getnetworkinfo()['subversion']
+
+        def find_conn(node, peer_subversion, inbound):
+            return next(filter(lambda peer: peer['subver'] == peer_subversion and peer['inbound'] == inbound, node.getpeerinfo()), None)
+
+        self.wait_until(lambda: not find_conn(from_connection, to_connection_subver, inbound=False))
+        self.wait_until(lambda: not find_conn(to_connection, from_connection_subver, inbound=True))
+
         ip_port = "127.0.0.1:" + str(p2p_port(b))
-        from_connection.addnode(ip_port, "onetry")
-        # poll until version handshake complete to avoid race conditions
-        # with transaction relaying
-        # See comments in net_processing:
-        # * Must have a version message before anything else
-        # * Must have a verack message before anything else
-        self.wait_until(lambda: sum(peer['version'] != 0 for peer in from_connection.getpeerinfo()) == from_num_peers)
-        self.wait_until(lambda: sum(peer['version'] != 0 for peer in to_connection.getpeerinfo()) == to_num_peers)
-        self.wait_until(lambda: sum(peer['bytesrecv_per_msg'].pop('verack', 0) == 24 for peer in from_connection.getpeerinfo()) == from_num_peers)
-        self.wait_until(lambda: sum(peer['bytesrecv_per_msg'].pop('verack', 0) == 24 for peer in to_connection.getpeerinfo()) == to_num_peers)
-        # The message bytes are counted before processing the message, so make
-        # sure it was fully processed by waiting for a ping.
-        self.wait_until(lambda: sum(peer["bytesrecv_per_msg"].pop("pong", 0) >= 32 for peer in from_connection.getpeerinfo()) == from_num_peers)
-        self.wait_until(lambda: sum(peer["bytesrecv_per_msg"].pop("pong", 0) >= 32 for peer in to_connection.getpeerinfo()) == to_num_peers)
+
+        if peer_advertises_v2 is None:
+            peer_advertises_v2 = from_connection.use_v2transport
+
+        if peer_advertises_v2 != from_connection.use_v2transport:
+            from_connection.addnode(node=ip_port, command="onetry", v2transport=peer_advertises_v2)
+        else:
+            # skip the optional third argument if it matches the default, for
+            # compatibility with older clients
+            from_connection.addnode(ip_port, "onetry")
+
+        self.wait_until(lambda: find_conn(from_connection, to_connection_subver, inbound=False) is not None)
+        self.wait_until(lambda: find_conn(to_connection, from_connection_subver, inbound=True) is not None)
+
+        def check_bytesrecv(peer, msg_type, min_bytes_recv):
+            assert peer is not None, "Error: peer disconnected"
+            return peer['bytesrecv_per_msg'].pop(msg_type, 0) >= min_bytes_recv
+
+        # Poll until version handshake (fSuccessfullyConnected) is complete to
+        # avoid race conditions, because some message types are blocked from
+        # being sent or received before fSuccessfullyConnected.
+        #
+        # As the flag fSuccessfullyConnected is not exposed, check it by
+        # waiting for a pong, which can only happen after the flag was set.
+        self.wait_until(lambda: check_bytesrecv(find_conn(from_connection, to_connection_subver, inbound=False), 'pong', 29))
+        self.wait_until(lambda: check_bytesrecv(find_conn(to_connection, from_connection_subver, inbound=True), 'pong', 29))
 
     def disconnect_nodes(self, a, b):
         def disconnect_nodes_helper(node_a, node_b):
@@ -653,26 +663,43 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         pass
 
     def generate(self, generator, *args, sync_fun=None, **kwargs):
-        blocks = generator.generate(*args, invalid_call=False, **kwargs)
+        blocks = generator.generate(*args, called_by_framework=True, **kwargs)
         sync_fun() if sync_fun else self.sync_all()
         return blocks
 
     def generateblock(self, generator, *args, sync_fun=None, **kwargs):
-        blocks = generator.generateblock(*args, invalid_call=False, **kwargs)
+        blocks = generator.generateblock(*args, called_by_framework=True, **kwargs)
         sync_fun() if sync_fun else self.sync_all()
         return blocks
 
     def generatetoaddress(self, generator, *args, sync_fun=None, **kwargs):
-        blocks = generator.generatetoaddress(*args, invalid_call=False, **kwargs)
+        blocks = generator.generatetoaddress(*args, called_by_framework=True, **kwargs)
         sync_fun() if sync_fun else self.sync_all()
         return blocks
 
     def generatetodescriptor(self, generator, *args, sync_fun=None, **kwargs):
-        blocks = generator.generatetodescriptor(*args, invalid_call=False, **kwargs)
+        blocks = generator.generatetodescriptor(*args, called_by_framework=True, **kwargs)
         sync_fun() if sync_fun else self.sync_all()
         return blocks
 
-    def sync_blocks(self, nodes=None, wait=1, timeout=60):
+    def create_outpoints(self, node, *, outputs):
+        """Send funds to a given list of `{address: amount}` targets using the bitcoind
+        wallet and return the corresponding outpoints as a list of dictionaries
+        `[{"txid": txid, "vout": vout1}, {"txid": txid, "vout": vout2}, ...]`.
+        The result can be used to specify inputs for RPCs like `createrawtransaction`,
+        `createpsbt`, `lockunspent` etc."""
+        for output in outputs:
+            assert_equal(len(output.keys()), 1)
+        send_res = node.send(outputs)
+        assert send_res["complete"]
+        utxos = []
+        for output in outputs:
+            address = list(output.keys())[0]
+            vout = find_vout_for_address(node, send_res["txid"], address)
+            utxos.append({"txid": send_res["txid"], "vout": vout})
+        return utxos
+
+    def sync_blocks(self, nodes=None, *, wait=0.05, timeout=60):
         """
         Wait until everybody has the same tip.
         sync_blocks needs to be called with an rpc_connections set that has least
@@ -681,8 +708,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         """
         rpc_connections = nodes or self.nodes
         timeout = int(timeout * self.options.timeout_factor)
-        stop_time = time.time() + timeout
-        while time.time() <= stop_time:
+        stop_time = time.monotonic() + timeout
+        while time.monotonic() <= stop_time:
             best_hash = [x.getbestblockhash() for x in rpc_connections]
             if best_hash.count(best_hash[0]) == len(rpc_connections):
                 return
@@ -694,15 +721,15 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             "".join("\n  {!r}".format(b) for b in best_hash),
         ))
 
-    def sync_mempools(self, nodes=None, wait=1, timeout=60, flush_scheduler=True):
+    def sync_mempools(self, nodes=None, *, wait=0.05, timeout=60, flush_scheduler=True):
         """
         Wait until everybody has the same transactions in their memory
         pools
         """
         rpc_connections = nodes or self.nodes
         timeout = int(timeout * self.options.timeout_factor)
-        stop_time = time.time() + timeout
-        while time.time() <= stop_time:
+        stop_time = time.monotonic() + timeout
+        while time.monotonic() <= stop_time:
             pool = [set(r.getrawmempool()) for r in rpc_connections]
             if pool.count(pool[0]) == len(rpc_connections):
                 if flush_scheduler:
@@ -717,12 +744,139 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             "".join("\n  {!r}".format(m) for m in pool),
         ))
 
+    def wait_for_index_sync(self, nodes=None, **kwargs):
+        """Wait for every enabled index to reach each node's chain tip."""
+        nodes = nodes or self.nodes
+
+        for node in nodes:
+            node.wait_for_index_sync(**kwargs)
+
     def sync_all(self, nodes=None):
         self.sync_blocks(nodes)
         self.sync_mempools(nodes)
+        self.wait_for_index_sync(nodes)
 
-    def wait_until(self, test_function, timeout=60):
-        return wait_until_helper(test_function, timeout=timeout, timeout_factor=self.options.timeout_factor)
+    def wait_until(self, test_function, *, timeout=60, check_interval=0.05):
+        return wait_until_helper_internal(test_function, timeout=timeout, timeout_factor=self.options.timeout_factor, check_interval=check_interval)
+
+    def fill_node_addrman(self, *, node_index, address_types_to_add):
+        ADDRESSES = {
+            CAddress.NET_IPV4: [
+                "20.0.0.1",
+                "30.0.0.1",
+                "40.0.0.1",
+                "50.0.0.1",
+                "60.0.0.1",
+                "70.0.0.1",
+                "80.0.0.1",
+                "90.0.0.1",
+                "100.0.0.1",
+                "110.0.0.1",
+                "120.0.0.1",
+                "130.0.0.1",
+                "140.0.0.1",
+                "150.0.0.1",
+                "160.0.0.1",
+                "170.0.0.1",
+                "180.0.0.1",
+                "190.0.0.1",
+                "200.0.0.1",
+                "210.0.0.1",
+            ],
+            CAddress.NET_IPV6: [
+                "[20::1]",
+                "[30::1]",
+                "[40::1]",
+                "[50::1]",
+                "[60::1]",
+                "[70::1]",
+                "[80::1]",
+                "[90::1]",
+                "[100::1]",
+                "[110::1]",
+                "[120::1]",
+                "[130::1]",
+                "[140::1]",
+                "[150::1]",
+                "[160::1]",
+                "[170::1]",
+                "[180::1]",
+                "[190::1]",
+                "[200::1]",
+                "[210::1]",
+            ],
+            CAddress.NET_TORV3: [
+                "testonlyad777777777777777777777777777777777777777775b6qd.onion",
+                "testonlyah77777777777777777777777777777777777777777z7ayd.onion",
+                "testonlyal77777777777777777777777777777777777777777vp6qd.onion",
+                "testonlyap77777777777777777777777777777777777777777r5qad.onion",
+                "testonlyat77777777777777777777777777777777777777777udsid.onion",
+                "testonlyax77777777777777777777777777777777777777777yciid.onion",
+                "testonlya777777777777777777777777777777777777777777rhgyd.onion",
+                "testonlybd77777777777777777777777777777777777777777rs4ad.onion",
+                "testonlybp77777777777777777777777777777777777777777zs2ad.onion",
+                "testonlybt777777777777777777777777777777777777777777x6id.onion",
+                "testonlybx777777777777777777777777777777777777777775styd.onion",
+                "testonlyb3777777777777777777777777777777777777777774ckid.onion",
+                "testonlycd77777777777777777777777777777777777777777733id.onion",
+                "testonlych77777777777777777777777777777777777777777t6kid.onion",
+                "testonlycl77777777777777777777777777777777777777777tt3ad.onion",
+                "testonlyct77777777777777777777777777777777777777777wvhyd.onion",
+                "testonlycx7777777777777777777777777777777777777777774bad.onion",
+                "testonlyc377777777777777777777777777777777777777777u6aid.onion",
+                "testonlydd777777777777777777777777777777777777777777u5ad.onion",
+                "testonlydh77777777777777777777777777777777777777777wgnyd.onion",
+            ],
+            CAddress.NET_I2P: [
+                "testonlyad77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyah77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyap77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyat77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyax77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlya377777777777777777777777777777777777777777q.b32.i2p",
+                "testonlya777777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybd77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybh77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybl77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybp77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybt77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlybx77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyb777777777777777777777777777777777777777777q.b32.i2p",
+                "testonlych77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlycp77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyct77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlycx77777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyc377777777777777777777777777777777777777777q.b32.i2p",
+                "testonlyc777777777777777777777777777777777777777777q.b32.i2p",
+            ],
+            CAddress.NET_CJDNS: [
+                "[fc00::1]",
+                "[fc00::2]",
+                "[fc00::3]",
+                "[fc00::5]",
+                "[fc00::6]",
+                "[fc00::7]",
+                "[fc00::8]",
+                "[fc00::9]",
+                "[fc00::10]",
+                "[fc00::11]",
+                "[fc00::12]",
+                "[fc00::13]",
+                "[fc00::15]",
+                "[fc00::16]",
+                "[fc00::17]",
+                "[fc00::18]",
+                "[fc00::19]",
+                "[fc00::20]",
+                "[fc00::22]",
+                "[fc00::23]",
+            ],
+        }
+        for addr_type in address_types_to_add:
+            for addr in ADDRESSES[addr_type]:
+                res = self.nodes[node_index].addpeeraddress(address=addr, port=0 if addr.endswith(".i2p") else 8333, tried=False)
+                if not res["success"]:
+                    self.log.debug(f"Could not add {addr} to nodes[{node_index}]'s addrman (collision?)")
 
     # Private helper methods. These should not be accessed by the subclass test scripts.
 
@@ -731,16 +885,23 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         self.log = logging.getLogger('TestFramework')
         self.log.setLevel(logging.DEBUG)
         # Create file handler to log all messages
-        fh = logging.FileHandler(self.options.tmpdir + '/test_framework.log', encoding='utf-8')
+        fh = logging.FileHandler(self.options.tmpdir + '/test_framework.log')
         fh.setLevel(logging.DEBUG)
         # Create console handler to log messages to stderr. By default this logs only error messages, but can be configured with --loglevel.
         ch = logging.StreamHandler(sys.stdout)
         # User can provide log level as a number or string (eg DEBUG). loglevel was caught as a string, so try to convert it to an int
         ll = int(self.options.loglevel) if self.options.loglevel.isdigit() else self.options.loglevel.upper()
         ch.setLevel(ll)
+
         # Format logs the same as bitcoind's debug.log with microprecision (so log files can be concatenated and sorted)
-        formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d000Z %(name)s (%(levelname)s): %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
-        formatter.converter = time.gmtime
+        class MicrosecondFormatter(logging.Formatter):
+            def formatTime(self, record, _=None):
+                dt = datetime.fromtimestamp(record.created, timezone.utc)
+                return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+        formatter = MicrosecondFormatter(
+            fmt='%(asctime)sZ %(name)s (%(levelname)s): %(message)s',
+        )
         fh.setFormatter(formatter)
         ch.setFormatter(formatter)
         # add the handlers to the logger
@@ -774,15 +935,14 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                     cache_node_dir,
                     chain=self.chain,
                     extra_conf=["bind=127.0.0.1"],
-                    extra_args=['-disablewallet'],
+                    extra_args=[],
                     rpchost=None,
                     timewait=self.rpc_timeout,
                     timeout_factor=self.options.timeout_factor,
-                    bitcoind=self.options.bitcoind,
-                    bitcoin_cli=self.options.bitcoincli,
+                    binaries=self.get_binaries(),
                     coverage_dir=None,
                     cwd=self.options.tmpdir,
-                    descriptors=self.options.descriptors,
+                    uses_wallet=self.uses_wallet,
                 ))
             self.start_node(CACHE_NODE_ID)
             cache_node = self.nodes[CACHE_NODE_ID]
@@ -814,13 +974,13 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             self.stop_nodes()
             self.nodes = []
 
-            def cache_path(*paths):
-                return os.path.join(cache_node_dir, self.chain, *paths)
+            cache_path = cache_node.chain_path
 
-            os.rmdir(cache_path('wallets'))  # Remove empty wallets dir
-            for entry in os.listdir(cache_path()):
-                if entry not in ['chainstate', 'blocks', 'indexes']:  # Only indexes, chainstate and blocks folders
-                    os.remove(cache_path(entry))
+            (cache_path / "wallets").rmdir()  # Do not cache empty wallets dir
+            shutil.rmtree(cache_path / "fees")  # Do not cache fees dat files
+            for entry in cache_path.iterdir():
+                if entry.name not in ["chainstate", "blocks", "indexes"]:  # Only keep indexes, chainstate and blocks folders
+                    entry.unlink()
 
         for i in range(self.num_nodes):
             self.log.debug("Copy cache directory {} to node {}".format(cache_node_dir, i))
@@ -850,6 +1010,13 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         except ImportError:
             raise SkipTest("sqlite3 module not available.")
 
+    def skip_if_no_py_capnp(self):
+        """Attempt to import the capnp package and skip the test if the import fails."""
+        try:
+            import capnp  # type: ignore[import] # noqa: F401
+        except ImportError:
+            raise SkipTest("capnp module not available.")
+
     def skip_if_no_python_bcc(self):
         """Attempt to import the bcc package and skip the tests if the import fails."""
         try:
@@ -873,6 +1040,11 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         if platform.system() != "Linux":
             raise SkipTest("not on a Linux system")
 
+    def skip_if_no_lsof_on_nonlinux(self):
+        """Skip the running test if the lsof utility is not available on non-Linux platforms."""
+        if sys.platform != "linux" and shutil.which("lsof") is None:
+            raise SkipTest("lsof not available")
+
     def skip_if_platform_not_posix(self):
         """Skip the running test if we are not on a POSIX platform"""
         if os.name != 'posix':
@@ -885,50 +1057,72 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
     def skip_if_no_wallet(self):
         """Skip the running test if wallet has not been compiled."""
-        self._requires_wallet = True
+        self.uses_wallet = True
         if not self.is_wallet_compiled():
             raise SkipTest("wallet has not been compiled.")
-        if self.options.descriptors:
-            self.skip_if_no_sqlite()
-        else:
-            self.skip_if_no_bdb()
-
-    def skip_if_no_sqlite(self):
-        """Skip the running test if sqlite has not been compiled."""
-        if not self.is_sqlite_compiled():
-            raise SkipTest("sqlite has not been compiled.")
-
-    def skip_if_no_bdb(self):
-        """Skip the running test if BDB has not been compiled."""
-        if not self.is_bdb_compiled():
-            raise SkipTest("BDB has not been compiled.")
 
     def skip_if_no_wallet_tool(self):
         """Skip the running test if bitcoin-wallet has not been compiled."""
         if not self.is_wallet_tool_compiled():
             raise SkipTest("bitcoin-wallet has not been compiled")
 
+    def skip_if_no_bitcoin_tx(self):
+        """Skip the running test if bitcoin-tx has not been compiled."""
+        if not self.is_bitcoin_tx_compiled():
+            raise SkipTest("bitcoin-tx has not been compiled")
+
     def skip_if_no_bitcoin_util(self):
         """Skip the running test if bitcoin-util has not been compiled."""
         if not self.is_bitcoin_util_compiled():
             raise SkipTest("bitcoin-util has not been compiled")
+
+    def skip_if_no_bitcoin_chainstate(self):
+        """Skip the running test if bitcoin-chainstate has not been compiled."""
+        if not self.is_bitcoin_chainstate_compiled():
+            raise SkipTest("bitcoin-chainstate has not been compiled")
+
+    def skip_if_no_bitcoin_bench(self):
+        """Skip the running test if bench_bitcoin has not been compiled."""
+        if not self.is_bench_compiled():
+            raise SkipTest("bench_bitcoin has not been compiled")
 
     def skip_if_no_cli(self):
         """Skip the running test if bitcoin-cli has not been compiled."""
         if not self.is_cli_compiled():
             raise SkipTest("bitcoin-cli has not been compiled.")
 
+    def skip_if_no_ipc(self):
+        """Skip the running test if ipc is not compiled."""
+        if not self.is_ipc_compiled():
+            raise SkipTest("ipc has not been compiled.")
+
+    def skip_if_no_gui(self):
+        """Skip the running test if the GUI has not been compiled."""
+        if not self.is_gui_compiled():
+            raise SkipTest("GUI has not been compiled.")
+
     def skip_if_no_previous_releases(self):
         """Skip the running test if previous releases are not available."""
         if not self.has_previous_releases():
             raise SkipTest("previous releases not available or disabled")
 
+    def has_resource_module(self):
+        """Checks whether the resource module is available."""
+        return find_spec('resource') is not None
+
+    @property
+    def RLIM_INFINITY(self):
+        if not self.has_resource_module():
+            return None
+        import resource
+        return resource.RLIM_INFINITY
+
     def has_previous_releases(self):
         """Checks whether previous releases are present and enabled."""
         if not os.path.isdir(self.options.previous_releases_path):
             if self.options.prev_releases:
-                raise AssertionError("Force test of previous releases but releases missing: {}".format(
-                    self.options.previous_releases_path))
+                raise AssertionError(f"Force test of previous releases but releases missing: {self.options.previous_releases_path}\n"
+                                     "Previous releases binaries can be downloaded via `test/get_previous_releases.py`.")
         return self.options.prev_releases
 
     def skip_if_no_external_signer(self):
@@ -936,46 +1130,83 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         if not self.is_external_signer_compiled():
             raise SkipTest("external signer support has not been compiled.")
 
+    def skip_if_running_under_valgrind(self):
+        """Skip the running test if Valgrind is being used."""
+        if self.options.valgrind:
+            raise SkipTest("This test is not compatible with Valgrind.")
+
+    def is_bench_compiled(self):
+        """Checks whether bench_bitcoin was compiled."""
+        return self.config.getboolean("components", "BUILD_BENCH")
+
     def is_cli_compiled(self):
         """Checks whether bitcoin-cli was compiled."""
-        return self.config["components"].getboolean("ENABLE_CLI")
+        return self.config.getboolean("components", "ENABLE_CLI")
 
     def is_external_signer_compiled(self):
         """Checks whether external signer support was compiled."""
-        return self.config["components"].getboolean("ENABLE_EXTERNAL_SIGNER")
+        return self.config.getboolean("components", "ENABLE_EXTERNAL_SIGNER")
 
     def is_wallet_compiled(self):
         """Checks whether the wallet module was compiled."""
-        return self.config["components"].getboolean("ENABLE_WALLET")
-
-    def is_specified_wallet_compiled(self):
-        """Checks whether wallet support for the specified type
-           (legacy or descriptor wallet) was compiled."""
-        if self.options.descriptors:
-            return self.is_sqlite_compiled()
-        else:
-            return self.is_bdb_compiled()
+        return self.config.getboolean("components", "ENABLE_WALLET")
 
     def is_wallet_tool_compiled(self):
         """Checks whether bitcoin-wallet was compiled."""
-        return self.config["components"].getboolean("ENABLE_WALLET_TOOL")
+        return self.config.getboolean("components", "ENABLE_WALLET_TOOL")
+
+    def is_bitcoin_tx_compiled(self):
+        """Checks whether bitcoin-tx was compiled."""
+        return self.config.getboolean("components", "BUILD_BITCOIN_TX")
 
     def is_bitcoin_util_compiled(self):
         """Checks whether bitcoin-util was compiled."""
-        return self.config["components"].getboolean("ENABLE_BITCOIN_UTIL")
+        return self.config.getboolean("components", "ENABLE_BITCOIN_UTIL")
+
+    def is_bitcoin_chainstate_compiled(self):
+        """Checks whether bitcoin-chainstate was compiled."""
+        return self.config.getboolean("components", "ENABLE_BITCOIN_CHAINSTATE")
 
     def is_zmq_compiled(self):
         """Checks whether the zmq module was compiled."""
-        return self.config["components"].getboolean("ENABLE_ZMQ")
+        return self.config.getboolean("components", "ENABLE_ZMQ")
+
+    def is_embedded_asmap_compiled(self):
+        """Checks whether ASMap data was embedded during compilation."""
+        return self.config.getboolean("components", "ENABLE_EMBEDDED_ASMAP")
 
     def is_usdt_compiled(self):
         """Checks whether the USDT tracepoints were compiled."""
-        return self.config["components"].getboolean("ENABLE_USDT_TRACEPOINTS")
+        return self.config.getboolean("components", "ENABLE_USDT_TRACEPOINTS")
 
-    def is_sqlite_compiled(self):
-        """Checks whether the wallet module was compiled with Sqlite support."""
-        return self.config["components"].getboolean("USE_SQLITE")
+    def is_ipc_compiled(self):
+        """Checks whether ipc was compiled."""
+        return self.config.getboolean("components", "ENABLE_IPC")
 
-    def is_bdb_compiled(self):
-        """Checks whether the wallet module was compiled with BDB support."""
-        return self.config["components"].getboolean("USE_BDB")
+    def is_gui_compiled(self):
+        """Checks whether the GUI was compiled."""
+        return self.config.getboolean("components", "BUILD_GUI")
+
+    def is_qt_vcpkg(self):
+        """Checks whether Qt was built with vcpkg (VCPKG_TARGET_TRIPLET is set)."""
+        return bool(self.config.get("components", "VCPKG_TARGET_TRIPLET"))
+
+    def has_blockfile(self, node, filenum: str):
+        return (node.blocks_path/ f"blk{filenum}.dat").is_file()
+
+    def inspect_sqlite_db(self, path, fn, *args, **kwargs):
+        try:
+            import sqlite3 # type: ignore[import]
+            conn = sqlite3.connect(path)
+            with conn:
+                result = fn(conn, *args, **kwargs)
+            conn.close()
+            return result
+        except ImportError:
+            self.log.warning("sqlite3 module not available, skipping tests that inspect the database")
+
+    def cleanup_folder(self, _path):
+        path = Path(_path)
+        if not path.is_relative_to(self.options.tmpdir):
+            raise AssertionError(f"Trying to delete #{path} outside of #{self.options.tmpdir}")
+        shutil.rmtree(path)

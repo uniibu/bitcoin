@@ -1,33 +1,35 @@
-// Copyright (c) 2020-2021 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <common/messages.h>
 #include <merkleblock.h>
-#include <policy/fees.h>
+#include <node/types.h>
+#include <outputtype.h>
+#include <policy/fees/block_policy_estimator.h>
 #include <rpc/util.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
-#include <util/error.h>
+#include <util/check.h>
 #include <util/translation.h>
 
-#include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
+
+using common::TransactionErrorString;
+using node::TransactionError;
 
 namespace {
 constexpr TransactionError ALL_TRANSACTION_ERROR[] = {
-    TransactionError::OK,
     TransactionError::MISSING_INPUTS,
-    TransactionError::ALREADY_IN_CHAIN,
-    TransactionError::P2P_DISABLED,
+    TransactionError::ALREADY_IN_UTXO_SET,
     TransactionError::MEMPOOL_REJECTED,
     TransactionError::MEMPOOL_ERROR,
-    TransactionError::INVALID_PSBT,
-    TransactionError::PSBT_MISMATCH,
-    TransactionError::SIGHASH_MISMATCH,
     TransactionError::MAX_FEE_EXCEEDED,
+    TransactionError::MAX_FEE_RATE_EXCEEDED,
 };
 }; // namespace
 

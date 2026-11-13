@@ -1,11 +1,13 @@
-// Copyright (c) 2022 The Bitcoin Core developers
+// Copyright (c) 2022-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <util/bitdeque.h>
 
 #include <random.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/util.h>
-#include <util/bitdeque.h>
+#include <util/check.h>
 
 #include <deque>
 #include <vector>
@@ -53,21 +55,10 @@ FUZZ_TARGET(bitdeque, .init = InitRandData)
         --initlen;
     }
 
-    LIMITED_WHILE(provider.remaining_bytes() > 0, 900)
-    {
-        {
-            assert(deq.size() == bitdeq.size());
-            auto it = deq.begin();
-            auto bitit = bitdeq.begin();
-            auto itend = deq.end();
-            while (it != itend) {
-                assert(*it == *bitit);
-                ++it;
-                ++bitit;
-            }
-        }
-
-        CallOneOf(provider,
+    const auto iter_limit{maxlen > 6000 ? 90U : 900U};
+    LIMITED_WHILE (provider.remaining_bytes() > 0, iter_limit) {
+        CallOneOf(
+            provider,
             [&] {
                 // constructor()
                 deq = std::deque<bool>{};
@@ -535,7 +526,17 @@ FUZZ_TARGET(bitdeque, .init = InitRandData)
                     assert(it == deq.begin() + before);
                     assert(bitit == bitdeq.begin() + before);
                 }
-            }
-        );
+            });
+    }
+    {
+        assert(deq.size() == bitdeq.size());
+        auto it = deq.begin();
+        auto bitit = bitdeq.begin();
+        auto itend = deq.end();
+        while (it != itend) {
+            assert(*it == *bitit);
+            ++it;
+            ++bitit;
+        }
     }
 }

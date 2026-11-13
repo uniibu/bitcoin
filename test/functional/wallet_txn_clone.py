@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2014-2022 The Bitcoin Core developers
+# Copyright (c) 2014-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test the wallet accounts properly when there are cloned transactions with malleated scriptsigs."""
@@ -7,7 +7,8 @@
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
-    find_vout_for_address
+    assert_not_equal,
+    assert_raises_rpc_error,
 )
 from test_framework.messages import (
     COIN,
@@ -18,13 +19,12 @@ from test_framework.messages import (
 class TxnMallTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 3
-        self.supports_cli = False
+        self.extra_args = [[] for i in range(self.num_nodes)]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
     def add_options(self, parser):
-        self.add_wallet_options(parser)
         parser.add_argument("--mineblock", dest="mine_block", default=False, action="store_true",
                             help="Test double-spend of 1-confirmed transaction")
         parser.add_argument("--segwit", dest="segwit", default=False, action="store_true",
@@ -35,10 +35,10 @@ class TxnMallTest(BitcoinTestFramework):
         super().setup_network()
         self.disconnect_nodes(1, 2)
 
-    def spend_txid(self, txid, vout, outputs):
-        inputs = [{"txid": txid, "vout": vout}]
+    def spend_utxo(self, utxo, outputs):
+        inputs = [utxo]
         tx = self.nodes[0].createrawtransaction(inputs, outputs)
-        tx = self.nodes[0].fundrawtransaction(tx)
+        tx = self.nodes[0].fundrawtransaction(tx, fee_rate=100)
         tx = self.nodes[0].signrawtransactionwithwallet(tx['hex'])
         return self.nodes[0].sendrawtransaction(tx['hex'])
 
@@ -53,16 +53,14 @@ class TxnMallTest(BitcoinTestFramework):
         for i in range(3):
             assert_equal(self.nodes[i].getbalance(), starting_balance)
 
-        self.nodes[0].settxfee(.001)
-
         node0_address1 = self.nodes[0].getnewaddress(address_type=output_type)
-        node0_txid1 = self.nodes[0].sendtoaddress(node0_address1, 1219)
-        node0_tx1 = self.nodes[0].gettransaction(node0_txid1)
-        self.nodes[0].lockunspent(False, [{"txid":node0_txid1, "vout": find_vout_for_address(self.nodes[0], node0_txid1, node0_address1)}])
+        node0_utxo1 = self.create_outpoints(self.nodes[0], outputs=[{node0_address1: 1219}])[0]
+        node0_tx1 = self.nodes[0].gettransaction(node0_utxo1['txid'])
+        self.nodes[0].lockunspent(False, [node0_utxo1])
 
         node0_address2 = self.nodes[0].getnewaddress(address_type=output_type)
-        node0_txid2 = self.nodes[0].sendtoaddress(node0_address2, 29)
-        node0_tx2 = self.nodes[0].gettransaction(node0_txid2)
+        node0_utxo2 = self.create_outpoints(self.nodes[0], outputs=[{node0_address2: 29}])[0]
+        node0_tx2 = self.nodes[0].gettransaction(node0_utxo2['txid'])
 
         assert_equal(self.nodes[0].getbalance(),
                      starting_balance + node0_tx1["fee"] + node0_tx2["fee"])
@@ -71,8 +69,8 @@ class TxnMallTest(BitcoinTestFramework):
         node1_address = self.nodes[1].getnewaddress()
 
         # Send tx1, and another transaction tx2 that won't be cloned
-        txid1 = self.spend_txid(node0_txid1, find_vout_for_address(self.nodes[0], node0_txid1, node0_address1), {node1_address: 40})
-        txid2 = self.spend_txid(node0_txid2, find_vout_for_address(self.nodes[0], node0_txid2, node0_address2), {node1_address: 20})
+        txid1 = self.spend_utxo(node0_utxo1, {node1_address: 40})
+        txid2 = self.spend_utxo(node0_utxo2, {node1_address: 20})
 
         # Construct a clone of tx1, to be malleated
         rawtx1 = self.nodes[0].getrawtransaction(txid1, 1)
@@ -148,6 +146,109 @@ class TxnMallTest(BitcoinTestFramework):
             expected -= 50
         assert_equal(self.nodes[0].getbalance(), expected)
 
+        self.test_malleated_metadata_synced()
+        self.test_malleated_rbf_metadata_synced()
+
+    def malleate_tx(self, wallet, txid):
+        rawtx = wallet.getrawtransaction(txid)
+        tx = tx_from_hex(rawtx)
+        for txin in tx.vin:
+            txin.scriptSig = b""
+        for wit in tx.wit.vtxinwit:
+            wit.scriptWitness.stack.clear()
+        unsigned_tx = tx.serialize_without_witness().hex()
+
+        # malleate the tx by signing with a different sighash
+        malleated_tx = wallet.signrawtransactionwithwallet(hexstring=unsigned_tx, sighashtype="ALL|ANYONECANPAY")["hex"]
+        malleated_txid = wallet.decoderawtransaction(malleated_tx)["txid"]
+        assert_not_equal(malleated_txid, txid)
+        return malleated_tx, malleated_txid
+
+
+    def test_malleated_metadata_synced(self):
+        self.log.info("Test malleated tx has copied user provided metadata")
+        self.nodes[0].createwallet("metadata_clone")
+        wallet = self.nodes[0].get_wallet_rpc("metadata_clone")
+        def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+
+        # Make non-segwit UTXOs that can be malleated. Smaller than the spending amount
+        # to create multiple inputs.
+        for _ in range(6):
+            def_wallet.sendtoaddress(wallet.getnewaddress(address_type="legacy"), 0.5)
+
+        self.generate(self.nodes[0], 1)
+
+        # Bumping either should prevent the other from being bumped as well
+        for bump_malleated in [False, True]:
+            original_txid = wallet.sendtoaddress(def_wallet.getnewaddress(), 0.9, comment="testing", fee_rate=1)
+            malleated_tx, malleated_txid = self.malleate_tx(wallet, original_txid)
+
+            blockhash = self.generateblock(self.nodes[0], def_wallet.getnewaddress(), [malleated_tx])["hash"]
+
+            assert_equal(wallet.gettransaction(malleated_txid)["comment"], "testing")
+
+            # Check synced comment was written to disk
+            wallet.unloadwallet()
+            self.nodes[0].loadwallet("metadata_clone")
+            assert_equal(wallet.gettransaction(malleated_txid)["comment"], "testing")
+
+            # Put the malleated back into the mempol by invalidating the block
+            self.nodes[0].invalidateblock(blockhash)
+
+            if bump_malleated:
+                to_bump = malleated_txid
+                other_bump = original_txid
+            else:
+                to_bump = original_txid
+                other_bump = malleated_txid
+
+            bumped = wallet.bumpfee(to_bump, fee_rate=10)
+
+            def check_metadata():
+                original_txinfo = wallet.gettransaction(original_txid)
+                malleated_txinfo = wallet.gettransaction(malleated_txid)
+                assert_equal(original_txinfo["replaced_by_txid"], bumped["txid"])
+                assert_equal(malleated_txinfo["replaced_by_txid"], bumped["txid"])
+
+                assert_raises_rpc_error(-4, f"Cannot bump transaction {other_bump} which was already bumped by transaction", wallet.bumpfee, other_bump, fee_rate=20)
+
+            check_metadata()
+
+            # Check persistence
+            wallet.unloadwallet()
+            self.nodes[0].loadwallet("metadata_clone")
+
+            check_metadata()
+
+            self.nodes[0].reconsiderblock(blockhash)
+
+    def test_malleated_rbf_metadata_synced(self):
+        self.log.info("Test malleation of a rbf has copied user provided and replacement metadata")
+        self.nodes[0].createwallet("rbf_metadata_clone")
+        wallet = self.nodes[0].get_wallet_rpc("rbf_metadata_clone")
+        def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+
+        def_wallet.sendtoaddress(wallet.getnewaddress(address_type="legacy"), 1)
+
+        self.generate(self.nodes[0], 1)
+
+        orig_txid = wallet.sendtoaddress(def_wallet.getnewaddress(), 0.9999, comment="testing")
+        txid = wallet.bumpfee(orig_txid)["txid"]
+        malleated_tx, malleated_txid = self.malleate_tx(wallet, txid)
+
+        self.generateblock(self.nodes[0], def_wallet.getnewaddress(), [malleated_tx])
+
+        txinfo = wallet.gettransaction(malleated_txid)
+        assert_equal(txinfo["comment"], "testing")
+        assert_equal(txinfo["replaces_txid"], orig_txid)
+
+        # Synced metadata must survive a reload
+        wallet.unloadwallet()
+        self.nodes[0].loadwallet("rbf_metadata_clone")
+        txinfo = wallet.gettransaction(malleated_txid)
+        assert_equal(txinfo["comment"], "testing")
+        assert_equal(txinfo["replaces_txid"], orig_txid)
+
 
 if __name__ == '__main__':
-    TxnMallTest().main()
+    TxnMallTest(__file__).main()

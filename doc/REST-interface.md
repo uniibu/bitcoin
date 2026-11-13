@@ -4,7 +4,7 @@ Unauthenticated REST Interface
 The REST API can be enabled with the `-rest` option.
 
 The interface runs on the same port as the JSON-RPC interface, by default port 8332 for mainnet, port 18332 for testnet,
-port 38332 for signet, and port 18443 for regtest.
+port 48332 for testnet4, port 38332 for signet, and port 18443 for regtest.
 
 REST Interface consistency guarantees
 -------------------------------------
@@ -12,17 +12,24 @@ REST Interface consistency guarantees
 The [same guarantees as for the RPC Interface](/doc/JSON-RPC-interface.md#rpc-consistency-guarantees)
 apply.
 
-Limitations
------------
+Default HTTP caching
+--------------------
 
-There is a known issue in the REST interface that can cause a node to crash if
-too many http connections are being opened at the same time because the system runs
-out of available file descriptors. To prevent this from happening you might
-want to increase the number of maximum allowed file descriptors in your system
-and try to prevent opening too many connections to your rest interface at the
-same time if this is under your control. It is hard to give general advice
-since this depends on your system but if you make several hundred requests at
-once you are definitely at risk of encountering this issue.
+REST responses include `Cache-Control` headers by default:
+
+* `public, immutable, max-age=86400` for `/block` and `/block/notxdetails`
+  binary and hex responses, `/blockpart`, `/blockfilter` and `/spenttxouts` in
+  all formats, and `/deploymentinfo/<BLOCKHASH>.json`. The TTL is deliberately
+  short so caches do not hold older response shapes across software upgrades.
+* `no-store` for `/block` and `/block/notxdetails` JSON, `/tx`, `/headers`,
+  `/blockfilterheaders`, `/blockhashbyheight`, `/chaininfo`, `/mempool`,
+  `/getutxos`, `/deploymentinfo.json`, and all error responses. These responses
+  can change with active chain or node state and do not currently provide cache
+  validators such as `ETag` or `Last-Modified`.
+
+If you front `bitcoind` with a reverse proxy or CDN such as Caddy or nginx with
+the headers-more module, you can override these defaults there. Keep overrides
+scoped to responses you know are safe to cache more aggressively.
 
 Supported API
 -------------
@@ -46,6 +53,11 @@ Responds with 404 if the block doesn't exist.
 The HTTP request and response are both handled entirely in-memory.
 
 With the /notxdetails/ option JSON response will only contain the transaction hash instead of the complete transaction details. The option only affects the JSON response.
+
+- `GET /rest/blockpart/<BLOCK-HASH>.<bin|hex>?offset=<OFFSET>&size=<SIZE>`
+
+Given a block hash: returns a block part, in binary or hex-encoded binary formats.
+Responds with 404 if the block or the byte range doesn't exist.
 
 #### Blockheaders
 `GET /rest/headers/<BLOCK-HASH>.<bin|hex|json>?count=<COUNT=5>`
@@ -78,6 +90,14 @@ Responds with 404 if the block doesn't exist.
 
 Given a height: returns hash of block in best-block-chain at height provided.
 Responds with 404 if block not found.
+
+#### Spent transaction outputs
+`GET /rest/spenttxouts/<BLOCK-HASH>.<bin|hex|json>`
+
+Given a block hash: returns a collection of spent transaction output lists,
+one per transaction in the block.
+Responds with 404 if the block doesn't exist or its undo data is not available.
+The JSON format matches the prevout objects of the `getblock` RPC with verbosity 3.
 
 #### Chaininfos
 `GET /rest/chaininfo.json`
@@ -117,7 +137,7 @@ $ curl localhost:18332/rest/getutxos/checkmempool/b2cdfd7b89def827ff8af7cd9bff76
          "value" : 8.8687,
          "scriptPubKey" : {
             "asm" : "OP_DUP OP_HASH160 1c7cebb529b86a04c683dfa87be49de35bcf589e OP_EQUALVERIFY OP_CHECKSIG",
-            "desc" : "addr(mi7as51dvLJsizWnTMurtRmrP8hG2m1XvD)#gj9tznmy"
+            "desc" : "addr(mi7as51dvLJsizWnTMurtRmrP8hG2m1XvD)#gj9tznmy",
             "hex" : "76a9141c7cebb529b86a04c683dfa87be49de35bcf589e88ac",
             "type" : "pubkeyhash",
             "address" : "mi7as51dvLJsizWnTMurtRmrP8hG2m1XvD"

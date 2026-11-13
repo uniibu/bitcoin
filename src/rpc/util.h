@@ -1,27 +1,47 @@
-// Copyright (c) 2017-2022 The Bitcoin Core developers
+// Copyright (c) 2017-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_RPC_UTIL_H
 #define BITCOIN_RPC_UTIL_H
 
-#include <node/transaction.h>
-#include <outputtype.h>
-#include <protocol.h>
+#include <addresstype.h>
+#include <consensus/amount.h>
+#include <policy/feerate.h>
 #include <pubkey.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <script/script.h>
-#include <script/sign.h>
-#include <script/standard.h>
+#include <uint256.h>
 #include <univalue.h>
 #include <util/check.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
-static constexpr bool DEFAULT_RPC_DOC_CHECK{
+enum class OutputType;
+struct FlatSigningProvider;
+struct bilingual_str;
+class CBlockIndex;
+
+namespace common {
+enum class PSBTError;
+} // namespace common
+namespace node {
+enum class TransactionError;
+} // namespace node
+
+inline constexpr bool DEFAULT_RPC_DOC_CHECK{
 #ifdef RPC_DOC_CHECK
     true
 #else
@@ -41,10 +61,11 @@ extern const std::string UNIX_EPOCH_TIME;
  */
 extern const std::string EXAMPLE_ADDRESS[2];
 
-class FillableSigningProvider;
-class CPubKey;
-class CScript;
 struct Sections;
+
+struct HelpResult : std::runtime_error {
+    explicit HelpResult(const std::string& msg) : std::runtime_error{msg} {}
+};
 
 /**
  * Gets all existing output types formatted for RPC help sections.
@@ -74,10 +95,21 @@ void RPCTypeCheckObj(const UniValue& o,
  * Utilities: convert hex-encoded Values
  * (throws error if not hex).
  */
-uint256 ParseHashV(const UniValue& v, std::string strName);
-uint256 ParseHashO(const UniValue& o, std::string strKey);
-std::vector<unsigned char> ParseHexV(const UniValue& v, std::string strName);
-std::vector<unsigned char> ParseHexO(const UniValue& o, std::string strKey);
+uint256 ParseHashV(const UniValue& v, std::string_view name);
+uint256 ParseHashO(const UniValue& o, std::string_view strKey);
+std::vector<unsigned char> ParseHexV(const UniValue& v, std::string_view name);
+std::vector<unsigned char> ParseHexO(const UniValue& o, std::string_view strKey);
+
+/**
+ * Parses verbosity from provided UniValue.
+ *
+ * @param[in] arg The verbosity argument as an int (0, 1, 2,...) or bool if allow_bool is set to true
+ * @param[in] default_verbosity The value to return if verbosity argument is null
+ * @param[in] allow_bool If true, allows arg to be a bool and parses it
+ * @returns An integer describing the verbosity level (e.g. 0, 1, 2, etc.)
+ * @throws JSONRPCError if allow_bool is false but arg provided is boolean
+ */
+int ParseVerbosity(const UniValue& arg, int default_verbosity, bool allow_bool);
 
 /**
  * Validate and return a CAmount from a UniValue number or string.
@@ -87,6 +119,11 @@ std::vector<unsigned char> ParseHexO(const UniValue& o, std::string strKey);
  * @returns a CAmount if the various checks pass.
  */
 CAmount AmountFromValue(const UniValue& value, int decimals = 8);
+/**
+ * Parse a json number or string, denoting BTC/kvB, into a CFeeRate (sat/kvB).
+ * Reject negative values or rates larger than 1BTC/kvB.
+ */
+CFeeRate ParseFeeRate(const UniValue& json);
 
 using RPCArgList = std::vector<std::pair<std::string, UniValue>>;
 std::string HelpExampleCli(const std::string& methodname, const std::string& args);
@@ -95,28 +132,28 @@ std::string HelpExampleRpc(const std::string& methodname, const std::string& arg
 std::string HelpExampleRpcNamed(const std::string& methodname, const RPCArgList& args);
 
 CPubKey HexToPubKey(const std::string& hex_in);
-CPubKey AddrToPubKey(const FillableSigningProvider& keystore, const std::string& addr_in);
-CTxDestination AddAndGetMultisigDestination(const int required, const std::vector<CPubKey>& pubkeys, OutputType type, FillableSigningProvider& keystore, CScript& script_out);
+CTxDestination AddAndGetMultisigDestination(int required, const std::vector<CPubKey>& pubkeys, OutputType type, FlatSigningProvider& keystore, CScript& script_out);
 
 UniValue DescribeAddress(const CTxDestination& dest);
 
 /** Parse a sighash string representation and raise an RPC error if it is invalid. */
-int ParseSighashString(const UniValue& sighash);
+std::optional<int> ParseSighashString(const UniValue& sighash);
 
 //! Parse a confirm target option and raise an RPC error if it is invalid.
 unsigned int ParseConfirmTarget(const UniValue& value, unsigned int max_target);
 
-RPCErrorCode RPCErrorFromTransactionError(TransactionError terr);
-UniValue JSONRPCTransactionError(TransactionError terr, const std::string& err_string = "");
+RPCErrorCode RPCErrorFromTransactionError(node::TransactionError terr);
+UniValue JSONRPCPSBTError(common::PSBTError err);
+UniValue JSONRPCTransactionError(node::TransactionError terr, const std::string& err_string = "");
 
 //! Parse a JSON range specified as int64, or [int64, int64]
 std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value);
 
 /** Evaluate a descriptor given as a string, or as a {"desc":...,"range":...} object, with default range of 1000. */
-std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, const bool expand_priv = false);
+std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, bool expand_priv = false);
 
-/** Returns, given services flags, a list of humanly readable (known) network services */
-UniValue GetServicesNames(ServiceFlags services);
+//! Parse BIP32 path
+std::vector<uint32_t> ParsePathBIP32(const std::string& path);
 
 /**
  * Serializing JSON objects depends on the outer type. Only arrays and
@@ -132,6 +169,7 @@ struct RPCArgOptions {
     bool skip_type_check{false};
     std::string oneline_description{};   //!< Should be empty unless it is supposed to override the auto-generated summary line
     std::vector<std::string> type_str{}; //!< Should be empty unless it is supposed to override the auto-generated type strings. Vector length is either 0 or 2, m_opts.type_str.at(0) will override the type of the value in a key-value pair, m_opts.type_str.at(1) will override the type in the argument description.
+    bool placeholder{false};             //!< If set, the argument is retained only for compatibility and should generally be omitted.
     bool hidden{false};                  //!< For testing only
     bool also_positional{false};         //!< If set allows a named-parameter field in an OBJ_NAMED_PARAM options object
                                          //!< to have the same name as a top-level parameter. By default the RPC
@@ -144,6 +182,7 @@ struct RPCArgOptions {
                                          //!< methods set the also_positional flag and read values from both positions.
 };
 
+// NOLINTNEXTLINE(misc-no-recursion)
 struct RPCArg {
     enum class Type {
         OBJ,
@@ -197,7 +236,7 @@ struct RPCArg {
         std::string description,
         RPCArgOptions opts = {})
         : m_names{std::move(name)},
-          m_type{std::move(type)},
+          m_type{type},
           m_fallback{std::move(fallback)},
           m_description{std::move(description)},
           m_opts{std::move(opts)}
@@ -213,7 +252,7 @@ struct RPCArg {
         std::vector<RPCArg> inner,
         RPCArgOptions opts = {})
         : m_names{std::move(name)},
-          m_type{std::move(type)},
+          m_type{type},
           m_inner{std::move(inner)},
           m_fallback{std::move(fallback)},
           m_description{std::move(description)},
@@ -253,6 +292,18 @@ struct RPCArg {
     std::string ToDescriptionString(bool is_named_arg) const;
 };
 
+/// Controls how an RPCResult is rendered in human-readable help text.
+/// The std::string alternative carries the summary text rendered as "...".
+struct HelpElisionNone {}; //!< field printed normally
+struct HelpElisionSkip {}; //!< field hidden from help
+using HelpElision = std::variant<HelpElisionNone, HelpElisionSkip, std::string>;
+
+struct RPCResultOptions {
+    bool skip_type_check{false};
+    HelpElision print_elision{HelpElisionNone{}};
+};
+
+// NOLINTNEXTLINE(misc-no-recursion)
 struct RPCResult {
     enum class Type {
         OBJ,
@@ -261,20 +312,19 @@ struct RPCResult {
         NUM,
         BOOL,
         NONE,
-        ANY,        //!< Special type to disable type checks (for testing only)
+        ANY,        //!< Special type to disable type checks
         STR_AMOUNT, //!< Special string to represent a floating point amount
         STR_HEX,    //!< Special string with only hex chars
         OBJ_DYN,    //!< Special dictionary with keys that are not literals
         ARR_FIXED,  //!< Special array that has a fixed number of entries
         NUM_TIME,   //!< Special numeric to denote unix epoch time
-        ELISION,    //!< Special type to denote elision (...)
     };
 
     const Type m_type;
     const std::string m_key_name;         //!< Only used for dicts
     const std::vector<RPCResult> m_inner; //!< Only used for arrays or dicts
     const bool m_optional;
-    const bool m_skip_type_check;
+    const RPCResultOptions m_opts;
     const std::string m_description;
     const std::string m_cond;
 
@@ -284,12 +334,13 @@ struct RPCResult {
         std::string m_key_name,
         bool optional,
         std::string description,
-        std::vector<RPCResult> inner = {})
-        : m_type{std::move(type)},
+        std::vector<RPCResult> inner = {},
+        RPCResultOptions opts = {})
+        : m_type{type},
           m_key_name{std::move(m_key_name)},
           m_inner{std::move(inner)},
           m_optional{optional},
-          m_skip_type_check{false},
+          m_opts{std::move(opts)},
           m_description{std::move(description)},
           m_cond{std::move(cond)}
     {
@@ -302,8 +353,9 @@ struct RPCResult {
         Type type,
         std::string m_key_name,
         std::string description,
-        std::vector<RPCResult> inner = {})
-        : RPCResult{std::move(cond), type, std::move(m_key_name), /*optional=*/false, std::move(description), std::move(inner)} {}
+        std::vector<RPCResult> inner = {},
+        RPCResultOptions opts = {})
+        : RPCResult{std::move(cond), type, std::move(m_key_name), /*optional=*/false, std::move(description), std::move(inner), std::move(opts)} {}
 
     RPCResult(
         Type type,
@@ -311,12 +363,12 @@ struct RPCResult {
         bool optional,
         std::string description,
         std::vector<RPCResult> inner = {},
-        bool skip_type_check = false)
-        : m_type{std::move(type)},
+        RPCResultOptions opts = {})
+        : m_type{type},
           m_key_name{std::move(m_key_name)},
           m_inner{std::move(inner)},
           m_optional{optional},
-          m_skip_type_check{skip_type_check},
+          m_opts{std::move(opts)},
           m_description{std::move(description)},
           m_cond{}
     {
@@ -328,15 +380,21 @@ struct RPCResult {
         std::string m_key_name,
         std::string description,
         std::vector<RPCResult> inner = {},
-        bool skip_type_check = false)
-        : RPCResult{type, std::move(m_key_name), /*optional=*/false, std::move(description), std::move(inner), skip_type_check} {}
+        RPCResultOptions opts = {})
+        : RPCResult{type, std::move(m_key_name), /*optional=*/false, std::move(description), std::move(inner), std::move(opts)} {}
+
+    /// Copy with replacement options, for stamping new opts onto an existing result.
+    RPCResult(const RPCResult& other, RPCResultOptions opts)
+        : m_type{other.m_type},
+          m_key_name{other.m_key_name},
+          m_inner{other.m_inner},
+          m_optional{other.m_optional},
+          m_opts{std::move(opts)},
+          m_description{other.m_description},
+          m_cond{other.m_cond} {}
 
     /** Append the sections of the result. */
-    void ToSections(Sections& sections, OuterType outer_type = OuterType::NONE, const int current_indent = 0) const;
-    /** Return the type string of the result when it is in an object (dict). */
-    std::string ToStringObj() const;
-    /** Return the description string, including the result type. */
-    std::string ToDescriptionString() const;
+    void ToSections(Sections& sections, OuterType outer_type = OuterType::NONE, int current_indent = 0) const;
     /** Check whether the result JSON type matches.
      * Returns true if type matches, or object describing error(s) if not.
      */
@@ -345,6 +403,10 @@ struct RPCResult {
 private:
     void CheckInnerDoc() const;
 };
+
+/// Stamp elision onto an entire vector of RPCResult fields at once.
+/// Merges into existing m_opts so that flags like skip_type_check are preserved.
+std::vector<RPCResult> ElideGroup(std::vector<RPCResult> fields, std::string summary = "");
 
 struct RPCResults {
     const std::vector<RPCResult> m_results;
@@ -375,14 +437,78 @@ struct RPCExamples {
     std::string ToDescriptionString() const;
 };
 
-class RPCHelpMan
+class RPCMethod
 {
 public:
-    RPCHelpMan(std::string name, std::string description, std::vector<RPCArg> args, RPCResults results, RPCExamples examples);
-    using RPCMethodImpl = std::function<UniValue(const RPCHelpMan&, const JSONRPCRequest&)>;
-    RPCHelpMan(std::string name, std::string description, std::vector<RPCArg> args, RPCResults results, RPCExamples examples, RPCMethodImpl fun);
+    RPCMethod(std::string name, std::string description, std::vector<RPCArg> args, RPCResults results, RPCExamples examples);
+    using RPCMethodImpl = std::function<UniValue(const RPCMethod&, const JSONRPCRequest&)>;
+    RPCMethod(std::string name, std::string description, std::vector<RPCArg> args, RPCResults results, RPCExamples examples, RPCMethodImpl fun);
 
     UniValue HandleRequest(const JSONRPCRequest& request) const;
+    /**
+     * @brief Helper to get a required or default-valued request argument.
+     *
+     * Use this function when the argument is required or when it has a default value. If the
+     * argument is optional and may not be provided, use MaybeArg instead.
+     *
+     * This function only works during m_fun(), i.e., it should only be used in
+     * RPC method implementations. It internally checks whether the user-passed
+     * argument isNull() and parses (from JSON) and returns the user-passed argument,
+     * or the default value derived from the RPCArg documentation.
+     *
+     * The instantiation of this helper for type R must match the corresponding RPCArg::Type.
+     *
+     * @param key The first name of the argument. Aliases are not supported.
+     * @return The value of the RPC argument (or the default value) cast to type R.
+     *
+     * @see MaybeArg for handling optional arguments without default values.
+     */
+    template <typename R>
+    auto Arg(std::string_view key) const
+    {
+        auto i{GetParamIndex(key)};
+        // Return argument (required or with default value).
+        if constexpr (std::is_trivially_copyable_v<R>) {
+            // Return trivially copyable types by value.
+            return ArgValue<R>(i);
+        } else {
+            // Return everything else by reference.
+            return ArgValue<const R&>(i);
+        }
+    }
+    /**
+     * @brief Helper to get an optional request argument.
+     *
+     * Use this function when the argument is optional and does not have a default value. If the
+     * argument is required or has a default value, use Arg instead.
+     *
+     * This function only works during m_fun(), i.e., it should only be used in
+     * RPC method implementations. It internally checks whether the user-passed
+     * argument isNull() and parses (from JSON) and returns the user-passed argument,
+     * or a falsy value if no argument was passed.
+     *
+     * The instantiation of this helper for type R must match the corresponding RPCArg::Type.
+     *
+     * @param key The first name of the argument. Aliases are not supported.
+     * @return For trivially copyable types, a std::optional<R> is returned.
+     *         For other types, a R* pointer to the argument is returned. If the
+     *         argument is not provided, std::nullopt or a null pointer is returned.
+     *
+     * @see Arg for handling arguments that are required or have a default value.
+     */
+    template <typename R>
+    auto MaybeArg(std::string_view key) const
+    {
+        auto i{GetParamIndex(key)};
+        // Return optional argument (without default).
+        if constexpr (std::is_trivially_copyable_v<R>) {
+            // Return trivially copyable types by value, wrapped in optional.
+            return ArgValue<std::optional<R>>(i);
+        } else {
+            // Return other types by pointer.
+            return ArgValue<const R*>(i);
+        }
+    }
     std::string ToString() const;
     /** Return the named args that need to be converted from string to another JSON type */
     UniValue GetArgMap() const;
@@ -390,6 +516,9 @@ public:
     bool IsValidNumArgs(size_t num_args) const;
     //! Return list of arguments and whether they are named-only.
     std::vector<std::pair<std::string, bool>> GetArgNames() const;
+    const std::string& GetDescription() const { return m_description; }
+    const std::vector<RPCArg>& GetArgs() const { return m_args; }
+    const RPCResults& GetResults() const { return m_results; }
 
     const std::string m_name;
 
@@ -399,6 +528,11 @@ private:
     const std::vector<RPCArg> m_args;
     const RPCResults m_results;
     const RPCExamples m_examples;
+    mutable const JSONRPCRequest* m_req{nullptr}; // A pointer to the request for the duration of m_fun()
+    template <typename R>
+    R ArgValue(size_t i) const;
+    //! Return positional index of a parameter using its first name as key.
+    size_t GetParamIndex(std::string_view key) const;
 };
 
 /**
@@ -409,5 +543,17 @@ private:
  */
 void PushWarnings(const UniValue& warnings, UniValue& obj);
 void PushWarnings(const std::vector<bilingual_str>& warnings, UniValue& obj);
+
+std::vector<RPCResult> ScriptPubKeyDoc();
+
+/***
+ * Get the target for a given block index.
+ *
+ * @param[in] blockindex    the block
+ * @param[in] pow_limit     PoW limit (consensus parameter)
+ *
+ * @return  the target
+ */
+uint256 GetTarget(const CBlockIndex& blockindex, uint256 pow_limit);
 
 #endif // BITCOIN_RPC_UTIL_H

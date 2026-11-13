@@ -10,7 +10,8 @@ that file and modify to fit your needs.
 
 #### Coverage
 
-Running `test/functional/test_runner.py` with the `--coverage` argument tracks which RPCs are
+Assuming the build directory is `build`,
+running `build/test/functional/test_runner.py` with the `--coverage` argument tracks which RPCs are
 called by the tests and prints a report of uncovered RPCs in the summary. This
 can be used (along with the `--extended` argument) to find out which RPCs we
 don't have test cases for.
@@ -37,6 +38,10 @@ don't have test cases for.
   `set_test_params()`, `add_options()` and `setup_xxxx()` methods at the top of
   the subclass, then locally-defined helper methods, then the `run_test()` method.
 - Use `f'{x}'` for string formatting in preference to `'{}'.format(x)` or `'%s' % x`.
+- Use `platform.system()` for detecting the running operating system and `os.name` to
+  check whether it's a POSIX system (see also the `skip_if_platform_not_{linux,posix}`
+  methods in the `BitcoinTestFramework` class, which can be used to skip a whole test
+  depending on the platform).
 
 #### Naming guidelines
 
@@ -159,36 +164,3 @@ Test-only secp256k1 elliptic curve implementation
 
 #### [blocktools.py](test_framework/blocktools.py)
 Helper functions for creating blocks and transactions.
-
-### Benchmarking with perf
-
-An easy way to profile node performance during functional tests is provided
-for Linux platforms using `perf`.
-
-Perf will sample the running node and will generate profile data in the node's
-datadir. The profile data can then be presented using `perf report` or a graphical
-tool like [hotspot](https://github.com/KDAB/hotspot).
-
-There are two ways of invoking perf: one is to use the `--perf` flag when
-running tests, which will profile each node during the entire test run: perf
-begins to profile when the node starts and ends when it shuts down. The other
-way is the use the `profile_with_perf` context manager, e.g.
-
-```python
-with node.profile_with_perf("send-big-msgs"):
-    # Perform activity on the node you're interested in profiling, e.g.:
-    for _ in range(10000):
-        node.p2ps[0].send_message(some_large_message)
-```
-
-To see useful textual output, run
-
-```sh
-perf report -i /path/to/datadir/send-big-msgs.perf.data.xxxx --stdio | c++filt | less
-```
-
-#### See also:
-
-- [Installing perf](https://askubuntu.com/q/50145)
-- [Perf examples](https://www.brendangregg.com/perf.html)
-- [Hotspot](https://github.com/KDAB/hotspot): a GUI for perf output analysis

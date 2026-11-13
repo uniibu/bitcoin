@@ -4,17 +4,25 @@ $(package)_download_path=$(native_$(package)_download_path)
 $(package)_download_file=$(native_$(package)_download_file)
 $(package)_file_name=$(native_$(package)_file_name)
 $(package)_sha256_hash=$(native_$(package)_sha256_hash)
-$(package)_dependencies=native_$(package)
+$(package)_patches=macos_accept_dead_socket.patch
+$(package)_patches += kj_atomicaddref_atomic_read.patch
+$(package)_patches += kj_mutex_atomic_futex_reads.patch
 
-define $(package)_set_vars :=
-$(package)_config_opts := --with-external-capnp
-$(package)_config_opts += CAPNP="$$(native_capnp_prefixbin)/capnp"
-$(package)_config_opts += CAPNP_CXX="$$(native_capnp_prefixbin)/capnp-c++"
-$(package)_config_opts_android := --disable-shared
+define $(package)_set_vars
+  $(package)_config_opts := -DBUILD_TESTING=OFF
+  $(package)_config_opts += -DWITH_OPENSSL=OFF
+  $(package)_config_opts += -DWITH_ZLIB=OFF
+  $(package)_cxxflags += -fdebug-prefix-map=$($(package)_extract_dir)=/usr -fmacro-prefix-map=$($(package)_extract_dir)=/usr
+endef
+
+define $(package)_preprocess_cmds
+  patch -p2 < $($(package)_patch_dir)/macos_accept_dead_socket.patch && \
+  patch -p2 < $($(package)_patch_dir)/kj_atomicaddref_atomic_read.patch && \
+  patch -p2 < $($(package)_patch_dir)/kj_mutex_atomic_futex_reads.patch
 endef
 
 define $(package)_config_cmds
-  $($(package)_autoconf)
+  $($(package)_cmake) .
 endef
 
 define $(package)_build_cmds
@@ -23,4 +31,8 @@ endef
 
 define $(package)_stage_cmds
   $(MAKE) DESTDIR=$($(package)_staging_dir) install
+endef
+
+define $(package)_postprocess_cmds
+  rm -rf lib/pkgconfig
 endef
